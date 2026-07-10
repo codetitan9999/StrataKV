@@ -1,0 +1,7 @@
+build/
+cmake-build-*/
+.cache/
+.DS_Store
+*.log
+*.tmp
+stratakv-data/
