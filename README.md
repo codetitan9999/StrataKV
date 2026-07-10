@@ -1,54 +1,45 @@
 # StrataKV
 
-StrataKV is a C++ storage-engine project aimed at demonstrating real systems depth: persistent writes, LSM-style storage internals, crash recovery, compaction, benchmarking, and eventually a small distributed replication layer.
+StrataKV is a compact C++ key-value store that explores how LSM-tree storage engines work: append-only writes, memtables, immutable sorted files, recovery, compaction, and measurement.
 
-The project is intentionally scoped like a serious engineering portfolio piece rather than a broad CRUD app. Phase 1 focuses on a single-node persistent key-value store inspired by LevelDB/Bigtable concepts. Phase 2 adds networking and replication once the storage core has earned it.
+The API is small on purpose. The interesting part is inside the engine: how data moves from memory to disk, how crashes are recovered, and how performance changes as the storage layout evolves.
 
-## Current Status
+## What Works Today
 
-Milestone 0 scaffolds the foundation:
-
-- CMake-based C++20 project layout
-- Public `stratakv::DB` API with `Put`, `Get`, `Delete`, and iterators
-- In-memory memtable backed by a binary write-ahead log
-- WAL replay on database reopen
-- Internal extension points for SSTable read/write and compaction
+- C++20/CMake project structure
+- Public `stratakv::DB` API with `Put`, `Get`, `Delete`, and iterator support
+- Sorted in-memory memtable
+- Binary write-ahead log with per-record checksums
+- Delete tombstones
+- WAL replay on reopen
 - Dependency-free unit tests
-- Simple local benchmark harness for throughput and latency
+- Local benchmark harness for throughput and latency
+- Initial interfaces for SSTables and compaction
 
-## Build
+## Quick Start
 
 ```sh
 cmake -S . -B build
 cmake --build build
-```
-
-## Test
-
-```sh
 ctest --test-dir build --output-on-failure
 ```
 
-## Benchmark
+Run a simple local benchmark:
 
 ```sh
 ./build/stratakv_kv_bench 100000
 ```
 
-The current benchmark measures the in-process WAL + memtable path. Later milestones will add separate benchmarks for recovery, SSTable reads, compaction, range scans, and networked operations.
+## Design
 
-## Architecture Snapshot
-
-The first implementation uses a classic LSM-tree shape:
+The write path is intentionally straightforward:
 
 1. Writes append to the WAL before updating the mutable memtable.
-2. Reads check the memtable.
-3. Deletes are represented as tombstones.
-4. Reopening the database replays the WAL to reconstruct the memtable.
-5. Future flushes will write immutable SSTables under `sst/`.
-6. Future compaction will merge SSTables, discard shadowed values, and preserve tombstone semantics until safe.
+2. The memtable keeps keys sorted for point lookups and scans.
+3. Deletes are stored as tombstones.
+4. On restart, the WAL is replayed to rebuild the latest in-memory state.
 
-On disk, a database directory currently looks like this:
+The current database directory looks like this:
 
 ```text
 db/
@@ -57,40 +48,42 @@ db/
   sst/
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full plan.
+The `sst/` directory is reserved for immutable table files. The larger design is documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Repository Layout
+
+```text
+include/stratakv/   public API
+src/                storage engine internals
+tests/              unit tests
+benchmarks/         benchmark entry points
+docs/               architecture notes
+```
 
 ## Roadmap
 
-### Phase 1: Single-Node Storage Engine
+### Phase 1: Storage Engine
 
-- Durable WAL format with checksums and recovery tests
-- Mutable memtable and immutable memtable flush path
-- SSTable writer/reader with sorted blocks, index block, footer, and checksums
-- Point reads across memtable and SSTables
-- Iterators and range scans across levels
-- Size-tiered or leveled compaction
-- Manifest/version metadata and crash-safe file installation
-- Fault-injection tests for partial writes and recovery
-- Benchmarks for write throughput, read latency, range scans, recovery, and compaction
+- SSTable writer/reader with block checksums
+- Memtable flush and WAL rotation
+- Manifest metadata for crash-safe file installation
+- Reads across memtables and SSTables
+- Range scans through merged iterators
+- Compaction with tombstone handling
+- Recovery and corruption tests
+- Benchmarks for writes, reads, scans, recovery, and compaction
 
-### Phase 2: Networked Replicated Store
+### Phase 2: Distributed Layer
 
-- TCP/gRPC-like server API with explicit request/response serialization
-- Replicated write path with leader/follower roles
-- Recovery after follower restart
-- Configurable consistency tradeoffs for reads
+- Network server and client
+- Explicit request/response serialization
+- Leader/follower replication model
+- Restart recovery for followers
+- Read consistency options
 - Metrics for latency, throughput, WAL bytes, compaction work, and replication lag
 
-### Non-Goals For Now
+## Non-Goals
 
-- No Raft or multi-leader design until the single-node storage core is mature
-- No web UI until the systems behavior is worth visualizing
-- No large dependency stack unless a dependency earns its complexity
-
-## Resume Signal
-
-The intended end state should support resume bullets around:
-
-- Implemented an LSM-tree key-value store in modern C++ with WAL, SSTables, compaction, and crash recovery.
-- Built benchmark suites tracking write throughput, read latency percentiles, range scan performance, and recovery time.
-- Designed a simplified distributed replication layer with explicit consistency and failure-recovery tradeoffs.
+- No consensus protocol until the storage engine is mature
+- No web UI as a first milestone
+- No large dependency stack unless it clearly improves the system
