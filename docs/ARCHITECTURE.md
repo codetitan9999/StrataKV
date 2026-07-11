@@ -38,15 +38,14 @@ Deletes are tombstones, not immediate removals from history. Compaction decides 
 
 ### SSTables
 
-`src/sstable.*` currently defines the intended builder/reader seam. The planned table format is:
+`src/sstable.*` implements the first immutable sorted table format. The current format stores one sorted data block and a fixed footer:
 
 ```text
-data block(s)
-index block
-footer: index offset, index size, magic, version
+data block: repeated sorted key/value entries
+footer: entry count, data block size, checksum, magic
 ```
 
-Blocks should hold sorted key/value entries with restart points or prefix compression added only after the plain sorted-block format works. Checksums should protect blocks independently so corruption can be localized.
+The reader verifies the data-block checksum before decoding entries, rejects unsorted or malformed tables, supports binary-search point lookups, and exposes an iterator. Multi-block tables, index blocks, and prefix compression remain future work.
 
 ### Compaction
 
@@ -97,7 +96,7 @@ db/
   wal/
     current.log
   sst/
-    000001.sst       future
+    000001.sst       future DB-managed table
   MANIFEST           future
 ```
 
@@ -105,16 +104,16 @@ The manifest is intentionally not scaffolded as behavior yet. It becomes necessa
 
 ## Test Strategy
 
-Milestone 0 tests cover:
+Current tests cover:
 
 - Put/Get/Delete semantics
 - Iterator ordering and tombstone hiding
 - WAL replay across reopen
+- SSTable round trips, sorted iteration, key ordering validation, and checksum corruption detection
 
 Next test layers should add:
 
 - WAL corruption and partial-record recovery behavior
-- SSTable block encoding/decoding golden tests
 - Flush and reopen with table metadata
 - Iterator merge correctness across memtable and SSTables
 - Compaction correctness with overwritten keys and tombstones
@@ -148,9 +147,8 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 2: SSTable Format
 
-- Implement sorted table builder and reader
-- Add block checksums
-- Add table metadata tests and corruption tests
+- Add multi-block tables and index blocks
+- Add golden tests for table encoding
 - Read from both memtable and SSTable
 
 ### Milestone 3: Flush and Recovery
