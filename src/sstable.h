@@ -5,6 +5,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "stratakv/iterator.h"
 #include "stratakv/status.h"
@@ -29,6 +31,10 @@ class SSTableBuilder {
 
  private:
   std::filesystem::path path_;
+  std::vector<std::pair<std::string, std::string>> entries_;
+  std::string last_key_;
+  bool has_last_key_ = false;
+  bool finished_ = false;
 };
 
 class SSTableReader {
@@ -38,11 +44,16 @@ class SSTableReader {
 
   [[nodiscard]] std::pair<std::string, Status> Get(std::string_view key) const;
   [[nodiscard]] std::unique_ptr<Iterator> NewIterator() const;
+  [[nodiscard]] const TableMetadata& metadata() const;
 
  private:
-  explicit SSTableReader(std::filesystem::path path);
+  SSTableReader(std::filesystem::path path,
+                std::vector<std::pair<std::string, std::string>> entries,
+                TableMetadata metadata);
 
   std::filesystem::path path_;
+  std::vector<std::pair<std::string, std::string>> entries_;
+  TableMetadata metadata_;
 };
 
 }  // namespace stratakv
