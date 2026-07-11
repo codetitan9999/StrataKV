@@ -12,9 +12,10 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - Binary write-ahead log with per-record checksums
 - Delete tombstones
 - WAL replay on reopen
+- Single-block SSTable writer/reader with checksum validation
 - Dependency-free unit tests
 - Local benchmark harness for throughput and latency
-- Initial interfaces for SSTables and compaction
+- Initial interface for compaction
 
 ## Quick Start
 
@@ -64,7 +65,7 @@ docs/               architecture notes
 
 ### Phase 1: Storage Engine
 
-- SSTable writer/reader with block checksums
+- Multi-block SSTables with index blocks
 - Memtable flush and WAL rotation
 - Manifest metadata for crash-safe file installation
 - Reads across memtables and SSTables
