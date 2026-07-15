@@ -56,13 +56,21 @@ std::uint32_t Checksum(std::string_view payload) {
   return hash;
 }
 
-Status EncodeEntry(std::string& out, std::string_view key,
-                   std::string_view value) {
+Status EncodeEntry(std::string& out, const TableEntry& entry) {
+  const std::string_view key = entry.key;
+  const std::string_view value = entry.value;
   if (key.size() > std::numeric_limits<std::uint32_t>::max() ||
       value.size() > std::numeric_limits<std::uint32_t>::max()) {
     return Status::InvalidArgument("SSTable key/value is too large");
   }
+  if (entry.type != RecordType::kPut && entry.type != RecordType::kDelete) {
+    return Status::InvalidArgument("invalid SSTable entry type");
+  }
+  if (entry.type == RecordType::kDelete && !value.empty()) {
+    return Status::InvalidArgument("delete entries must not store values");
+  }
 
+  AppendFixed<std::uint8_t>(out, static_cast<std::uint8_t>(entry.type));
   AppendFixed<std::uint32_t>(out, static_cast<std::uint32_t>(key.size()));
   AppendFixed<std::uint32_t>(out, static_cast<std::uint32_t>(value.size()));
   out.append(key);
@@ -71,7 +79,7 @@ Status EncodeEntry(std::string& out, std::string_view key,
 }
 
 Status DecodeEntries(std::string_view data_block, std::uint64_t entry_count,
-                     std::vector<std::pair<std::string, std::string>>* out) {
+                     std::vector<TableEntry>* out) {
   if (entry_count > data_block.size()) {
     return Status::Corruption("SSTable entry count exceeds data block size");
   }
@@ -81,9 +89,11 @@ Status DecodeEntries(std::string_view data_block, std::uint64_t entry_count,
   out->reserve(static_cast<std::size_t>(entry_count));
 
   while (offset < data_block.size()) {
+    std::uint8_t type = 0;
     std::uint32_t key_size = 0;
     std::uint32_t value_size = 0;
-    if (!ReadFixed(data_block, &offset, &key_size) ||
+    if (!ReadFixed(data_block, &offset, &type) ||
+        !ReadFixed(data_block, &offset, &key_size) ||
         !ReadFixed(data_block, &offset, &value_size)) {
       return Status::Corruption("short SSTable entry header");
     }
@@ -102,11 +112,20 @@ Status DecodeEntries(std::string_view data_block, std::uint64_t entry_count,
     if (key.empty()) {
       return Status::Corruption("SSTable contains an empty key");
     }
-    if (!out->empty() && out->back().first >= key) {
+    if (!out->empty() && out->back().key >= key) {
       return Status::Corruption("SSTable keys are not strictly sorted");
     }
+    if (type != static_cast<std::uint8_t>(RecordType::kPut) &&
+        type != static_cast<std::uint8_t>(RecordType::kDelete)) {
+      return Status::Corruption("SSTable contains an invalid entry type");
+    }
+    if (type == static_cast<std::uint8_t>(RecordType::kDelete) &&
+        !value.empty()) {
+      return Status::Corruption("SSTable tombstone stores a value");
+    }
 
-    out->emplace_back(std::move(key), std::move(value));
+    out->push_back(TableEntry{static_cast<RecordType>(type), std::move(key),
+                              std::move(value)});
   }
 
   if (out->size() != entry_count) {
@@ -165,6 +184,15 @@ SSTableBuilder::SSTableBuilder(std::filesystem::path path)
     : path_(std::move(path)) {}
 
 Status SSTableBuilder::Add(std::string_view key, std::string_view value) {
+  return AddInternal(RecordType::kPut, key, value);
+}
+
+Status SSTableBuilder::AddDeletion(std::string_view key) {
+  return AddInternal(RecordType::kDelete, key, "");
+}
+
+Status SSTableBuilder::AddInternal(RecordType type, std::string_view key,
+                                   std::string_view value) {
   if (finished_) {
     return Status::InvalidArgument("cannot add entries after Finish");
   }
@@ -179,8 +207,11 @@ Status SSTableBuilder::Add(std::string_view key, std::string_view value) {
       value.size() > std::numeric_limits<std::uint32_t>::max()) {
     return Status::InvalidArgument("SSTable key/value is too large");
   }
+  if (type == RecordType::kDelete && !value.empty()) {
+    return Status::InvalidArgument("delete entries must not store values");
+  }
 
-  entries_.emplace_back(std::string(key), std::string(value));
+  entries_.push_back(TableEntry{type, std::string(key), std::string(value)});
   last_key_ = std::string(key);
   has_last_key_ = true;
   return Status::OK();
@@ -198,8 +229,8 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
   }
 
   std::string data_block;
-  for (const auto& [key, value] : entries_) {
-    Status encode_status = EncodeEntry(data_block, key, value);
+  for (const auto& entry : entries_) {
+    Status encode_status = EncodeEntry(data_block, entry);
     if (!encode_status.ok()) {
       return encode_status;
     }
@@ -231,8 +262,8 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
   }
 
   metadata->file_path = path_;
-  metadata->smallest_key = entries_.front().first;
-  metadata->largest_key = entries_.back().first;
+  metadata->smallest_key = entries_.front().key;
+  metadata->largest_key = entries_.back().key;
   metadata->entry_count = static_cast<std::uint64_t>(entries_.size());
   metadata->file_size_bytes =
       static_cast<std::uint64_t>(data_block.size() + footer.size());
@@ -291,7 +322,7 @@ std::pair<std::unique_ptr<SSTableReader>, Status> SSTableReader::Open(
     return {nullptr, Status::Corruption("SSTable data block checksum mismatch")};
   }
 
-  std::vector<std::pair<std::string, std::string>> entries;
+  std::vector<TableEntry> entries;
   Status decode_status = DecodeEntries(data_block, entry_count, &entries);
   if (!decode_status.ok()) {
     return {nullptr, decode_status};
@@ -302,8 +333,8 @@ std::pair<std::unique_ptr<SSTableReader>, Status> SSTableReader::Open(
   metadata.entry_count = entry_count;
   metadata.file_size_bytes = static_cast<std::uint64_t>(file.size());
   if (!entries.empty()) {
-    metadata.smallest_key = entries.front().first;
-    metadata.largest_key = entries.back().first;
+    metadata.smallest_key = entries.front().key;
+    metadata.largest_key = entries.back().key;
   }
 
   return {std::unique_ptr<SSTableReader>(
@@ -311,29 +342,55 @@ std::pair<std::unique_ptr<SSTableReader>, Status> SSTableReader::Open(
           Status::OK()};
 }
 
-std::pair<std::string, Status> SSTableReader::Get(std::string_view key) const {
+TableLookup SSTableReader::Lookup(std::string_view key) const {
   const auto it = std::lower_bound(
       entries_.begin(), entries_.end(), key,
-      [](const auto& row, std::string_view target) {
-        return row.first < target;
+      [](const TableEntry& entry, std::string_view target) {
+        return entry.key < target;
       });
 
-  if (it == entries_.end() || it->first != key) {
+  if (it == entries_.end() || it->key != key) {
+    return {};
+  }
+
+  TableLookup lookup;
+  lookup.found = true;
+  lookup.deleted = it->type == RecordType::kDelete;
+  if (!lookup.deleted) {
+    lookup.value = it->value;
+  }
+  return lookup;
+}
+
+std::pair<std::string, Status> SSTableReader::Get(std::string_view key) const {
+  const TableLookup lookup = Lookup(key);
+  if (!lookup.found || lookup.deleted) {
     return {"", Status::NotFound("key not found in SSTable")};
   }
 
-  return {it->second, Status::OK()};
+  return {lookup.value, Status::OK()};
 }
 
 std::unique_ptr<Iterator> SSTableReader::NewIterator() const {
-  return std::make_unique<SSTableIterator>(entries_);
+  std::vector<std::pair<std::string, std::string>> rows;
+  rows.reserve(entries_.size());
+  for (const TableEntry& entry : entries_) {
+    if (entry.type == RecordType::kPut) {
+      rows.emplace_back(entry.key, entry.value);
+    }
+  }
+  return std::make_unique<SSTableIterator>(std::move(rows));
+}
+
+const std::vector<TableEntry>& SSTableReader::entries() const {
+  return entries_;
 }
 
 const TableMetadata& SSTableReader::metadata() const { return metadata_; }
 
 SSTableReader::SSTableReader(
     std::filesystem::path path,
-    std::vector<std::pair<std::string, std::string>> entries,
+    std::vector<TableEntry> entries,
     TableMetadata metadata)
     : path_(std::move(path)),
       entries_(std::move(entries)),
