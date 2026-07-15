@@ -1,17 +1,24 @@
 #include "stratakv/db.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <filesystem>
+#include <iomanip>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "memtable.h"
 #include "record.h"
+#include "sstable.h"
 #include "wal.h"
 
 namespace stratakv {
@@ -33,6 +40,79 @@ Status ValidateKey(std::string_view key) {
   }
   return Status::OK();
 }
+
+std::filesystem::path TablePath(const std::filesystem::path& table_dir,
+                                std::uint64_t file_number) {
+  std::ostringstream name;
+  name << std::setw(6) << std::setfill('0') << file_number << ".sst";
+  return table_dir / name.str();
+}
+
+std::optional<std::uint64_t> ParseTableFileNumber(
+    const std::filesystem::path& path) {
+  if (path.extension() != ".sst") {
+    return std::nullopt;
+  }
+
+  const std::string stem = path.stem().string();
+  if (stem.empty()) {
+    return std::nullopt;
+  }
+
+  std::uint64_t file_number = 0;
+  const auto* begin = stem.data();
+  const auto* end = stem.data() + stem.size();
+  const auto result = std::from_chars(begin, end, file_number);
+  if (result.ec != std::errc{} || result.ptr != end) {
+    return std::nullopt;
+  }
+
+  return file_number;
+}
+
+class MaterializedIterator final : public Iterator {
+ public:
+  explicit MaterializedIterator(
+      std::vector<std::pair<std::string, std::string>> rows)
+      : rows_(std::move(rows)) {}
+
+  bool Valid() const override { return index_ < rows_.size(); }
+
+  void SeekToFirst() override { index_ = 0; }
+
+  void Seek(std::string_view target) override {
+    const auto it = std::lower_bound(
+        rows_.begin(), rows_.end(), target,
+        [](const auto& row, std::string_view key) { return row.first < key; });
+    index_ = static_cast<std::size_t>(it - rows_.begin());
+  }
+
+  void Next() override {
+    if (Valid()) {
+      ++index_;
+    }
+  }
+
+  std::string_view key() const override {
+    if (!Valid()) {
+      return {};
+    }
+    return rows_[index_].first;
+  }
+
+  std::string_view value() const override {
+    if (!Valid()) {
+      return {};
+    }
+    return rows_[index_].second;
+  }
+
+  Status status() const override { return Status::OK(); }
+
+ private:
+  std::vector<std::pair<std::string, std::string>> rows_;
+  std::size_t index_ = 0;
+};
 
 }  // namespace
 
@@ -76,6 +156,11 @@ class DBImpl final : public DB {
       return dir_status;
     }
 
+    Status table_status = LoadTables();
+    if (!table_status.ok()) {
+      return table_status;
+    }
+
     wal_path_ = wal_dir_ / "current.log";
     if (std::filesystem::exists(wal_path_, ec)) {
       Status recover_status = Recover();
@@ -115,7 +200,12 @@ class DBImpl final : public DB {
       }
     }
 
-    return memtable_.Apply(record);
+    status = memtable_.Apply(record);
+    if (!status.ok()) {
+      return status;
+    }
+
+    return MaybeFlushMemTable();
   }
 
   Status Delete(const WriteOptions& write_options,
@@ -141,7 +231,12 @@ class DBImpl final : public DB {
       }
     }
 
-    return memtable_.Apply(record);
+    status = memtable_.Apply(record);
+    if (!status.ok()) {
+      return status;
+    }
+
+    return MaybeFlushMemTable();
   }
 
   std::pair<std::string, Status> Get(const ReadOptions& read_options,
@@ -154,7 +249,31 @@ class DBImpl final : public DB {
     }
 
     std::lock_guard<std::mutex> lock(mu_);
-    return memtable_.Get(key);
+    const MemTableLookup memtable_lookup = memtable_.Lookup(key);
+    if (memtable_lookup.found) {
+      if (memtable_lookup.deleted) {
+        return {"", Status::NotFound("key not found")};
+      }
+      return {memtable_lookup.value, Status::OK()};
+    }
+
+    for (auto it = tables_.rbegin(); it != tables_.rend(); ++it) {
+      const TableMetadata& metadata = (*it)->metadata();
+      if (key < metadata.smallest_key || key > metadata.largest_key) {
+        continue;
+      }
+
+      const TableLookup table_lookup = (*it)->Lookup(key);
+      if (!table_lookup.found) {
+        continue;
+      }
+      if (table_lookup.deleted) {
+        return {"", Status::NotFound("key not found")};
+      }
+      return {table_lookup.value, Status::OK()};
+    }
+
+    return {"", Status::NotFound("key not found")};
   }
 
   std::unique_ptr<Iterator> NewIterator(
@@ -162,16 +281,166 @@ class DBImpl final : public DB {
     (void)read_options;
 
     std::lock_guard<std::mutex> lock(mu_);
-    return memtable_.NewIterator();
+
+    std::map<std::string, std::string> visible;
+    for (const auto& table : tables_) {
+      for (const TableEntry& entry : table->entries()) {
+        if (entry.type == RecordType::kDelete) {
+          visible.erase(entry.key);
+        } else {
+          visible[entry.key] = entry.value;
+        }
+      }
+    }
+
+    for (const MemTableEntry& entry : memtable_.Snapshot()) {
+      if (entry.type == RecordType::kDelete) {
+        visible.erase(entry.key);
+      } else {
+        visible[entry.key] = entry.value;
+      }
+    }
+
+    std::vector<std::pair<std::string, std::string>> rows;
+    rows.reserve(visible.size());
+    for (const auto& [visible_key, visible_value] : visible) {
+      rows.emplace_back(visible_key, visible_value);
+    }
+
+    return std::make_unique<MaterializedIterator>(std::move(rows));
   }
 
  private:
+  Status LoadTables() {
+    std::error_code ec;
+    std::vector<std::pair<std::uint64_t, std::filesystem::path>> table_files;
+
+    std::filesystem::directory_iterator it(table_dir_, ec);
+    if (ec) {
+      return Status::IOError("failed to scan SSTable directory " +
+                             table_dir_.string() + ": " + ec.message());
+    }
+
+    for (const auto& entry : it) {
+      const bool regular = entry.is_regular_file(ec);
+      if (ec) {
+        return Status::IOError("failed to inspect SSTable path " +
+                               entry.path().string() + ": " + ec.message());
+      }
+      if (!regular) {
+        continue;
+      }
+
+      const std::optional<std::uint64_t> file_number =
+          ParseTableFileNumber(entry.path());
+      if (!file_number.has_value()) {
+        continue;
+      }
+
+      table_files.emplace_back(*file_number, entry.path());
+      next_file_number_ = std::max(next_file_number_, *file_number + 1);
+    }
+
+    std::sort(table_files.begin(), table_files.end(),
+              [](const auto& lhs, const auto& rhs) {
+                return lhs.first < rhs.first;
+              });
+
+    for (const auto& [file_number, path] : table_files) {
+      auto [reader, status] = SSTableReader::Open(path);
+      if (!status.ok()) {
+        return status;
+      }
+      tables_.push_back(std::move(reader));
+      (void)file_number;
+    }
+
+    return Status::OK();
+  }
+
   Status Recover() {
     WalReader reader(wal_path_);
     return reader.Replay([this](const LogRecord& record) {
       last_sequence_ = std::max(last_sequence_, record.sequence);
       return memtable_.Apply(record);
     });
+  }
+
+  Status MaybeFlushMemTable() {
+    if (memtable_.empty() ||
+        memtable_.ApproximateMemoryUsage() < options_.write_buffer_size) {
+      return Status::OK();
+    }
+
+    return FlushMemTable();
+  }
+
+  Status FlushMemTable() {
+    const std::vector<MemTableEntry> snapshot = memtable_.Snapshot();
+    if (snapshot.empty()) {
+      return Status::OK();
+    }
+
+    const std::uint64_t file_number = next_file_number_++;
+    const std::filesystem::path final_path = TablePath(table_dir_, file_number);
+    const std::filesystem::path temporary_path = final_path.string() + ".tmp";
+
+    SSTableBuilder builder(temporary_path);
+    for (const MemTableEntry& entry : snapshot) {
+      Status add_status =
+          entry.type == RecordType::kDelete
+              ? builder.AddDeletion(entry.key)
+              : builder.Add(entry.key, entry.value);
+      if (!add_status.ok()) {
+        return add_status;
+      }
+    }
+
+    TableMetadata metadata;
+    Status finish_status = builder.Finish(&metadata);
+    if (!finish_status.ok()) {
+      return finish_status;
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(temporary_path, final_path, ec);
+    if (ec) {
+      return Status::IOError("failed to install SSTable " +
+                             final_path.string() + ": " + ec.message());
+    }
+
+    auto [reader, open_status] = SSTableReader::Open(final_path);
+    if (!open_status.ok()) {
+      return open_status;
+    }
+    tables_.push_back(std::move(reader));
+
+    Status wal_status = ResetWal();
+    if (!wal_status.ok()) {
+      return wal_status;
+    }
+
+    memtable_.Clear();
+    return Status::OK();
+  }
+
+  Status ResetWal() {
+    if (wal_ != nullptr) {
+      Status sync_status = wal_->Sync();
+      if (!sync_status.ok()) {
+        return sync_status;
+      }
+      wal_.reset();
+    }
+
+    auto next_wal = std::make_unique<WalWriter>(wal_path_);
+    Status open_status = next_wal->Open(/*append=*/false);
+    if (!open_status.ok()) {
+      return open_status;
+    }
+
+    wal_ = std::move(next_wal);
+    return Status::OK();
   }
 
   Options options_;
@@ -182,7 +451,9 @@ class DBImpl final : public DB {
 
   mutable std::mutex mu_;
   MemTable memtable_;
+  std::vector<std::unique_ptr<SSTableReader>> tables_;
   std::uint64_t last_sequence_ = 0;
+  std::uint64_t next_file_number_ = 1;
   std::unique_ptr<WalWriter> wal_;
 };
 
