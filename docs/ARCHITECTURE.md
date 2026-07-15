@@ -20,17 +20,18 @@ The public API is deliberately small. It should remain stable while internals ev
 ### Write Path
 
 - `src/wal.*`: append-only binary log with per-record checksums
+- `src/manifest.*`: append-only metadata log for installed SSTables
 - `src/memtable.*`: sorted mutable map storing latest value or tombstone
 - `src/db.cc`: coordinates WAL append, optional sync, memtable apply, flush, table loading, and recovery
 
-Current write order is WAL first, memtable second. When the memtable crosses the configured write buffer size, it is written to a numbered SSTable and the WAL is rotated.
+Current write order is WAL first, memtable second. When the memtable crosses the configured write buffer size, it is written to a numbered SSTable, recorded in the manifest, and then the WAL is rotated.
 
 ### Read Path
 
 Reads follow this order:
 
 1. mutable memtable
-2. newest-to-oldest flushed SSTables by key range
+2. newest-to-oldest manifest-listed SSTables by key range
 3. future leveled SSTables after compaction is introduced
 
 Deletes are tombstones, not immediate removals from history. Compaction decides when a tombstone is safe to drop.
@@ -57,6 +58,10 @@ The reader verifies the data-block checksum before decoding entries, rejects uns
 - Preserve tombstones until older levels cannot contain the deleted key.
 
 This is enough to show storage-engine depth without prematurely recreating every LevelDB detail.
+
+### Manifest
+
+`src/manifest.*` stores checksummed table metadata records. On open, StrataKV replays the manifest to decide which SSTables are installed, then replays the WAL for any writes that were not flushed. Directory scans are no longer the source of truth for table membership.
 
 ## Storage Model
 
@@ -97,10 +102,10 @@ db/
   sst/
     000001.sst
     000002.sst
-  MANIFEST           future
+  MANIFEST
 ```
 
-Table files are currently discovered by scanning `sst/` at open time. The manifest becomes necessary once file installation, deletion, and compaction need stronger crash-safety guarantees.
+The manifest currently records table creation. Later compaction work will add records for table deletion and version replacement.
 
 ## Test Strategy
 
@@ -111,11 +116,12 @@ Current tests cover:
 - WAL replay across reopen
 - SSTable round trips, sorted iteration, key ordering validation, and checksum corruption detection
 - Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
+- Manifest replay, invalid metadata rejection, checksum corruption detection, and missing table handling
 
 Next test layers should add:
 
 - WAL corruption and partial-record recovery behavior
-- Manifest-driven reopen with table metadata
+- Manifest records for compaction/version replacement
 - Streaming iterator merge correctness across memtable and SSTables
 - Compaction correctness with overwritten keys and tombstones
 - Fault injection around file creation, rename, and manifest updates
@@ -152,8 +158,8 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 3: Flush and Recovery
 
-- Install new tables through manifest updates
-- Reopen from manifest plus WAL
+- Add manifest version replacement records
+- Add table deletion records for compaction outputs
 
 ### Milestone 4: Iterators and Compaction
 
