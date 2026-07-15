@@ -21,18 +21,17 @@ The public API is deliberately small. It should remain stable while internals ev
 
 - `src/wal.*`: append-only binary log with per-record checksums
 - `src/memtable.*`: sorted mutable map storing latest value or tombstone
-- `src/db.cc`: coordinates WAL append, optional sync, memtable apply, and recovery
+- `src/db.cc`: coordinates WAL append, optional sync, memtable apply, flush, table loading, and recovery
 
-Current write order is WAL first, memtable second. That makes recovery semantics easy to reason about: anything visible in memory should have a preceding log record.
+Current write order is WAL first, memtable second. When the memtable crosses the configured write buffer size, it is written to a numbered SSTable and the WAL is rotated.
 
 ### Read Path
 
-Current reads consult the mutable memtable only. As SSTables arrive, reads will follow this order:
+Reads follow this order:
 
 1. mutable memtable
-2. immutable memtables waiting to flush
-3. newest-to-oldest level-0 SSTables
-4. leveled SSTables by key range
+2. newest-to-oldest flushed SSTables by key range
+3. future leveled SSTables after compaction is introduced
 
 Deletes are tombstones, not immediate removals from history. Compaction decides when a tombstone is safe to drop.
 
@@ -96,11 +95,12 @@ db/
   wal/
     current.log
   sst/
-    000001.sst       future DB-managed table
+    000001.sst
+    000002.sst
   MANIFEST           future
 ```
 
-The manifest is intentionally not scaffolded as behavior yet. It becomes necessary once files are flushed and installed atomically.
+Table files are currently discovered by scanning `sst/` at open time. The manifest becomes necessary once file installation, deletion, and compaction need stronger crash-safety guarantees.
 
 ## Test Strategy
 
@@ -110,12 +110,13 @@ Current tests cover:
 - Iterator ordering and tombstone hiding
 - WAL replay across reopen
 - SSTable round trips, sorted iteration, key ordering validation, and checksum corruption detection
+- Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
 
 Next test layers should add:
 
 - WAL corruption and partial-record recovery behavior
-- Flush and reopen with table metadata
-- Iterator merge correctness across memtable and SSTables
+- Manifest-driven reopen with table metadata
+- Streaming iterator merge correctness across memtable and SSTables
 - Compaction correctness with overwritten keys and tombstones
 - Fault injection around file creation, rename, and manifest updates
 
@@ -141,7 +142,6 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 ### Milestone 1: Storage Skeleton Hardening
 
 - Add manifest/version-set types
-- Add file-number allocation
 - Add structured logging around open/recovery
 - Add fault-injection hooks for filesystem operations
 
@@ -149,12 +149,9 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 - Add multi-block tables and index blocks
 - Add golden tests for table encoding
-- Read from both memtable and SSTable
 
 ### Milestone 3: Flush and Recovery
 
-- Flush memtable to immutable SSTable
-- Rotate WAL safely
 - Install new tables through manifest updates
 - Reopen from manifest plus WAL
 

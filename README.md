@@ -13,6 +13,8 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - Delete tombstones
 - WAL replay on reopen
 - Single-block SSTable writer/reader with checksum validation
+- Memtable flush to SSTables with WAL rotation
+- Reads from both memtable and flushed SSTables
 - Dependency-free unit tests
 - Local benchmark harness for throughput and latency
 - Initial interface for compaction
@@ -38,7 +40,9 @@ The write path is intentionally straightforward:
 1. Writes append to the WAL before updating the mutable memtable.
 2. The memtable keeps keys sorted for point lookups and scans.
 3. Deletes are stored as tombstones.
-4. On restart, the WAL is replayed to rebuild the latest in-memory state.
+4. Once the memtable crosses the write buffer limit, it is flushed to an immutable SSTable.
+5. The WAL is rotated after a successful flush.
+6. On restart, existing SSTables are loaded first, then the WAL is replayed.
 
 The current database directory looks like this:
 
@@ -47,9 +51,10 @@ db/
   wal/
     current.log
   sst/
+    000001.sst
 ```
 
-The `sst/` directory is reserved for immutable table files. The larger design is documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The larger design is documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Repository Layout
 
@@ -66,10 +71,8 @@ docs/               architecture notes
 ### Phase 1: Storage Engine
 
 - Multi-block SSTables with index blocks
-- Memtable flush and WAL rotation
 - Manifest metadata for crash-safe file installation
-- Reads across memtables and SSTables
-- Range scans through merged iterators
+- Streaming range scans through merged iterators
 - Compaction with tombstone handling
 - Recovery and corruption tests
 - Benchmarks for writes, reads, scans, recovery, and compaction
