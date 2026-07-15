@@ -45,6 +45,17 @@ if(STRATAKV_BUILD_TESTS)
 
   add_test(NAME stratakv_tests COMMAND stratakv_tests)
 
+  add_executable(stratakv_manifest_tests
+    tests/manifest_test.cc
+  )
+  target_link_libraries(stratakv_manifest_tests PRIVATE stratakv)
+  target_include_directories(stratakv_manifest_tests
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+
+  add_test(NAME stratakv_manifest_tests COMMAND stratakv_manifest_tests)
+
   add_executable(stratakv_sstable_tests
     tests/sstable_test.cc
   )
