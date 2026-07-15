@@ -64,6 +64,29 @@ std::unique_ptr<stratakv::DB> OpenOrFail(TestRunner* runner,
   return std::move(db);
 }
 
+std::unique_ptr<stratakv::DB> OpenOrFail(TestRunner* runner,
+                                         const std::filesystem::path& path,
+                                         const stratakv::Options& options) {
+  auto [db, status] = stratakv::DB::Open(options, path);
+  runner->ExpectOk(status, "open database");
+  return std::move(db);
+}
+
+int CountSSTables(const std::filesystem::path& db_path) {
+  const auto table_dir = db_path / "sst";
+  if (!std::filesystem::exists(table_dir)) {
+    return 0;
+  }
+
+  int count = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(table_dir)) {
+    if (entry.path().extension() == ".sst") {
+      ++count;
+    }
+  }
+  return count;
+}
+
 void PutGetDeleteRoundTrip(TestRunner* runner) {
   TempDir dir;
   auto db = OpenOrFail(runner, dir.path());
@@ -146,6 +169,98 @@ void ReplaysWalOnReopen(TestRunner* runner) {
   runner->Expect(beta == "two", "beta should survive reopen");
 }
 
+void FlushesMemTableToSSTable(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+
+  {
+    auto db = OpenOrFail(runner, dir.path(), options);
+    if (!db) {
+      return;
+    }
+
+    runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "alpha", "one"),
+                     "put alpha for flush");
+    runner->Expect(CountSSTables(dir.path()) == 1,
+                   "put should flush one SSTable");
+
+    auto [value, status] = db->Get(stratakv::ReadOptions{}, "alpha");
+    runner->ExpectOk(status, "get alpha from flushed table");
+    runner->Expect(value == "one", "flushed alpha value");
+  }
+
+  auto reopened = OpenOrFail(runner, dir.path(), options);
+  if (!reopened) {
+    return;
+  }
+
+  auto [value, status] = reopened->Get(stratakv::ReadOptions{}, "alpha");
+  runner->ExpectOk(status, "get alpha after table reopen");
+  runner->Expect(value == "one", "alpha should survive table reopen");
+}
+
+void FlushedTombstoneHidesOlderTableValue(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+
+  {
+    auto db = OpenOrFail(runner, dir.path(), options);
+    if (!db) {
+      return;
+    }
+
+    runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "alpha", "one"),
+                     "put alpha before tombstone");
+    runner->ExpectOk(db->Delete(stratakv::WriteOptions{}, "alpha"),
+                     "delete alpha tombstone");
+    runner->Expect(CountSSTables(dir.path()) == 2,
+                   "put and delete should each flush an SSTable");
+
+    auto [value, status] = db->Get(stratakv::ReadOptions{}, "alpha");
+    (void)value;
+    runner->Expect(status.code() == stratakv::Status::Code::kNotFound,
+                   "flushed tombstone should hide alpha");
+  }
+
+  auto reopened = OpenOrFail(runner, dir.path(), options);
+  if (!reopened) {
+    return;
+  }
+
+  auto [value, status] = reopened->Get(stratakv::ReadOptions{}, "alpha");
+  (void)value;
+  runner->Expect(status.code() == stratakv::Status::Code::kNotFound,
+                 "reopened tombstone should hide alpha");
+}
+
+void IteratorMergesFlushedTables(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+
+  auto db = OpenOrFail(runner, dir.path(), options);
+  if (!db) {
+    return;
+  }
+
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "c", "3"), "put c");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "a", "1"), "put a");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "b", "2"), "put b");
+  runner->ExpectOk(db->Delete(stratakv::WriteOptions{}, "b"), "delete b");
+
+  std::vector<std::string> keys;
+  auto it = db->NewIterator(stratakv::ReadOptions{});
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    keys.emplace_back(it->key());
+  }
+
+  runner->ExpectOk(it->status(), "flushed iterator status");
+  runner->Expect(keys == std::vector<std::string>({"a", "c"}),
+                 "iterator should merge flushed tables and tombstones");
+}
+
 }  // namespace
 
 int main() {
@@ -153,5 +268,8 @@ int main() {
   PutGetDeleteRoundTrip(&runner);
   IteratorOrdersLiveKeys(&runner);
   ReplaysWalOnReopen(&runner);
+  FlushesMemTableToSSTable(&runner);
+  FlushedTombstoneHidesOlderTableValue(&runner);
+  IteratorMergesFlushedTables(&runner);
   return runner.Finish();
 }

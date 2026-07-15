@@ -136,6 +136,42 @@ void DetectsCorruptDataBlock(TestRunner* runner) {
                  "corrupted data block should fail checksum verification");
 }
 
+void StoresDeleteMarkers(TestRunner* runner) {
+  TempDir dir;
+  const auto table_path = dir.path() / "000001.sst";
+
+  stratakv::SSTableBuilder builder(table_path);
+  runner->ExpectOk(builder.Add("alpha", "one"), "add alpha");
+  runner->ExpectOk(builder.AddDeletion("beta"), "add beta tombstone");
+  runner->ExpectOk(builder.Add("gamma", "three"), "add gamma");
+
+  stratakv::TableMetadata metadata;
+  runner->ExpectOk(builder.Finish(&metadata), "finish tombstone table");
+
+  auto [reader, open_status] = stratakv::SSTableReader::Open(table_path);
+  runner->ExpectOk(open_status, "open tombstone table");
+  if (!reader) {
+    return;
+  }
+
+  const stratakv::TableLookup lookup = reader->Lookup("beta");
+  runner->Expect(lookup.found, "tombstone lookup should find beta");
+  runner->Expect(lookup.deleted, "tombstone lookup should mark beta deleted");
+
+  auto [value, status] = reader->Get("beta");
+  (void)value;
+  runner->Expect(status.code() == stratakv::Status::Code::kNotFound,
+                 "public Get should hide tombstones");
+
+  std::vector<std::string> keys;
+  auto it = reader->NewIterator();
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    keys.emplace_back(it->key());
+  }
+  runner->Expect(keys == std::vector<std::string>({"alpha", "gamma"}),
+                 "table iterator should skip tombstones");
+}
+
 }  // namespace
 
 int main() {
@@ -143,5 +179,6 @@ int main() {
   WritesAndReadsSortedTable(&runner);
   RejectsOutOfOrderKeys(&runner);
   DetectsCorruptDataBlock(&runner);
+  StoresDeleteMarkers(&runner);
   return runner.Finish();
 }
