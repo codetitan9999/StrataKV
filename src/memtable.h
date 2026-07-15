@@ -15,6 +15,19 @@
 
 namespace stratakv {
 
+struct MemTableEntry {
+  RecordType type = RecordType::kPut;
+  std::uint64_t sequence = 0;
+  std::string key;
+  std::string value;
+};
+
+struct MemTableLookup {
+  bool found = false;
+  bool deleted = false;
+  std::string value;
+};
+
 class MemTable {
  public:
   Status Put(std::uint64_t sequence, std::string_view key,
@@ -22,9 +35,13 @@ class MemTable {
   Status Delete(std::uint64_t sequence, std::string_view key);
   Status Apply(const LogRecord& record);
 
+  [[nodiscard]] MemTableLookup Lookup(std::string_view key) const;
   [[nodiscard]] std::pair<std::string, Status> Get(std::string_view key) const;
+  [[nodiscard]] std::vector<MemTableEntry> Snapshot() const;
   [[nodiscard]] std::unique_ptr<Iterator> NewIterator() const;
   [[nodiscard]] std::size_t ApproximateMemoryUsage() const;
+  [[nodiscard]] bool empty() const;
+  void Clear();
 
  private:
   enum class ValueType {

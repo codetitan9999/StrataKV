@@ -99,12 +99,43 @@ Status MemTable::Apply(const LogRecord& record) {
 }
 
 std::pair<std::string, Status> MemTable::Get(std::string_view key) const {
-  const auto it = entries_.find(std::string(key));
-  if (it == entries_.end() || it->second.type == ValueType::kDeletion) {
+  const MemTableLookup lookup = Lookup(key);
+  if (!lookup.found || lookup.deleted) {
     return {"", Status::NotFound("key not found")};
   }
 
-  return {it->second.value, Status::OK()};
+  return {lookup.value, Status::OK()};
+}
+
+MemTableLookup MemTable::Lookup(std::string_view key) const {
+  const auto it = entries_.find(std::string(key));
+  if (it == entries_.end()) {
+    return {};
+  }
+
+  MemTableLookup lookup;
+  lookup.found = true;
+  lookup.deleted = it->second.type == ValueType::kDeletion;
+  if (!lookup.deleted) {
+    lookup.value = it->second.value;
+  }
+  return lookup;
+}
+
+std::vector<MemTableEntry> MemTable::Snapshot() const {
+  std::vector<MemTableEntry> snapshot;
+  snapshot.reserve(entries_.size());
+
+  for (const auto& [key, entry] : entries_) {
+    snapshot.push_back(MemTableEntry{
+        entry.type == ValueType::kValue ? RecordType::kPut : RecordType::kDelete,
+        entry.sequence,
+        key,
+        entry.value,
+    });
+  }
+
+  return snapshot;
 }
 
 std::unique_ptr<Iterator> MemTable::NewIterator() const {
@@ -122,6 +153,13 @@ std::unique_ptr<Iterator> MemTable::NewIterator() const {
 
 std::size_t MemTable::ApproximateMemoryUsage() const {
   return approximate_memory_usage_;
+}
+
+bool MemTable::empty() const { return entries_.empty(); }
+
+void MemTable::Clear() {
+  entries_.clear();
+  approximate_memory_usage_ = 0;
 }
 
 }  // namespace stratakv
