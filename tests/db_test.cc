@@ -184,6 +184,8 @@ void FlushesMemTableToSSTable(TestRunner* runner) {
                      "put alpha for flush");
     runner->Expect(CountSSTables(dir.path()) == 1,
                    "put should flush one SSTable");
+    runner->Expect(std::filesystem::exists(dir.path() / "MANIFEST"),
+                   "flush should create a manifest");
 
     auto [value, status] = db->Get(stratakv::ReadOptions{}, "alpha");
     runner->ExpectOk(status, "get alpha from flushed table");
@@ -261,6 +263,31 @@ void IteratorMergesFlushedTables(TestRunner* runner) {
                  "iterator should merge flushed tables and tombstones");
 }
 
+void MissingManifestTableFailsOpen(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+
+  {
+    auto db = OpenOrFail(runner, dir.path(), options);
+    if (!db) {
+      return;
+    }
+
+    runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "alpha", "one"),
+                     "put alpha before hiding table");
+  }
+
+  std::error_code ec;
+  std::filesystem::rename(dir.path() / "sst" / "000001.sst",
+                          dir.path() / "sst" / "000001.hidden", ec);
+  runner->Expect(!ec, "hide manifest-listed SSTable");
+
+  auto [db, status] = stratakv::DB::Open(options, dir.path());
+  (void)db;
+  runner->Expect(!status.ok(), "missing manifest-listed table should fail open");
+}
+
 }  // namespace
 
 int main() {
@@ -271,5 +298,6 @@ int main() {
   FlushesMemTableToSSTable(&runner);
   FlushedTombstoneHidesOlderTableValue(&runner);
   IteratorMergesFlushedTables(&runner);
+  MissingManifestTableFailsOpen(&runner);
   return runner.Finish();
 }
