@@ -1,14 +1,12 @@
 #include "stratakv/db.h"
 
 #include <algorithm>
-#include <charconv>
 #include <cstdint>
 #include <filesystem>
 #include <iomanip>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -16,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "manifest.h"
 #include "memtable.h"
 #include "record.h"
 #include "sstable.h"
@@ -46,28 +45,6 @@ std::filesystem::path TablePath(const std::filesystem::path& table_dir,
   std::ostringstream name;
   name << std::setw(6) << std::setfill('0') << file_number << ".sst";
   return table_dir / name.str();
-}
-
-std::optional<std::uint64_t> ParseTableFileNumber(
-    const std::filesystem::path& path) {
-  if (path.extension() != ".sst") {
-    return std::nullopt;
-  }
-
-  const std::string stem = path.stem().string();
-  if (stem.empty()) {
-    return std::nullopt;
-  }
-
-  std::uint64_t file_number = 0;
-  const auto* begin = stem.data();
-  const auto* end = stem.data() + stem.size();
-  const auto result = std::from_chars(begin, end, file_number);
-  if (result.ec != std::errc{} || result.ptr != end) {
-    return std::nullopt;
-  }
-
-  return file_number;
 }
 
 class MaterializedIterator final : public Iterator {
@@ -145,6 +122,7 @@ class DBImpl final : public DB {
 
     wal_dir_ = db_path_ / "wal";
     table_dir_ = db_path_ / "sst";
+    manifest_path_ = db_path_ / "MANIFEST";
 
     dir_status = EnsureDirectory(wal_dir_);
     if (!dir_status.ok()) {
@@ -159,6 +137,12 @@ class DBImpl final : public DB {
     Status table_status = LoadTables();
     if (!table_status.ok()) {
       return table_status;
+    }
+
+    manifest_ = std::make_unique<ManifestWriter>(manifest_path_);
+    Status manifest_status = manifest_->Open(/*append=*/true);
+    if (!manifest_status.ok()) {
+      return manifest_status;
     }
 
     wal_path_ = wal_dir_ / "current.log";
@@ -312,50 +296,29 @@ class DBImpl final : public DB {
 
  private:
   Status LoadTables() {
-    std::error_code ec;
-    std::vector<std::pair<std::uint64_t, std::filesystem::path>> table_files;
-
-    std::filesystem::directory_iterator it(table_dir_, ec);
-    if (ec) {
-      return Status::IOError("failed to scan SSTable directory " +
-                             table_dir_.string() + ": " + ec.message());
-    }
-
-    for (const auto& entry : it) {
-      const bool regular = entry.is_regular_file(ec);
-      if (ec) {
-        return Status::IOError("failed to inspect SSTable path " +
-                               entry.path().string() + ": " + ec.message());
-      }
-      if (!regular) {
-        continue;
-      }
-
-      const std::optional<std::uint64_t> file_number =
-          ParseTableFileNumber(entry.path());
-      if (!file_number.has_value()) {
-        continue;
-      }
-
-      table_files.emplace_back(*file_number, entry.path());
-      next_file_number_ = std::max(next_file_number_, *file_number + 1);
-    }
-
-    std::sort(table_files.begin(), table_files.end(),
-              [](const auto& lhs, const auto& rhs) {
-                return lhs.first < rhs.first;
-              });
-
-    for (const auto& [file_number, path] : table_files) {
-      auto [reader, status] = SSTableReader::Open(path);
+    ManifestReader reader(manifest_path_);
+    return reader.Replay([this](const TableMetadata& manifest_metadata) {
+      const std::filesystem::path path =
+          TablePath(table_dir_, manifest_metadata.file_number);
+      auto [table_reader, status] = SSTableReader::Open(path);
       if (!status.ok()) {
         return status;
       }
-      tables_.push_back(std::move(reader));
-      (void)file_number;
-    }
 
-    return Status::OK();
+      const TableMetadata& table_metadata = table_reader->metadata();
+      if (table_metadata.entry_count != manifest_metadata.entry_count ||
+          table_metadata.file_size_bytes != manifest_metadata.file_size_bytes ||
+          table_metadata.smallest_key != manifest_metadata.smallest_key ||
+          table_metadata.largest_key != manifest_metadata.largest_key) {
+        return Status::Corruption("manifest metadata does not match SSTable: " +
+                                  path.string());
+      }
+
+      next_file_number_ =
+          std::max(next_file_number_, manifest_metadata.file_number + 1);
+      tables_.push_back(std::move(table_reader));
+      return Status::OK();
+    });
   }
 
   Status Recover() {
@@ -401,12 +364,23 @@ class DBImpl final : public DB {
     if (!finish_status.ok()) {
       return finish_status;
     }
+    metadata.file_number = file_number;
+    metadata.file_path = final_path;
 
     std::error_code ec;
     std::filesystem::rename(temporary_path, final_path, ec);
     if (ec) {
       return Status::IOError("failed to install SSTable " +
                              final_path.string() + ": " + ec.message());
+    }
+
+    Status manifest_status = manifest_->AppendTable(metadata);
+    if (!manifest_status.ok()) {
+      return manifest_status;
+    }
+    manifest_status = manifest_->Sync();
+    if (!manifest_status.ok()) {
+      return manifest_status;
     }
 
     auto [reader, open_status] = SSTableReader::Open(final_path);
@@ -447,6 +421,7 @@ class DBImpl final : public DB {
   std::filesystem::path db_path_;
   std::filesystem::path wal_dir_;
   std::filesystem::path table_dir_;
+  std::filesystem::path manifest_path_;
   std::filesystem::path wal_path_;
 
   mutable std::mutex mu_;
@@ -454,6 +429,7 @@ class DBImpl final : public DB {
   std::vector<std::unique_ptr<SSTableReader>> tables_;
   std::uint64_t last_sequence_ = 0;
   std::uint64_t next_file_number_ = 1;
+  std::unique_ptr<ManifestWriter> manifest_;
   std::unique_ptr<WalWriter> wal_;
 };
 

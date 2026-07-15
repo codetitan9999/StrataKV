@@ -13,6 +13,7 @@ option(STRATAKV_BUILD_BENCHMARKS "Build StrataKV benchmark harnesses" ON)
 add_library(stratakv
   src/compaction.cc
   src/db.cc
+  src/manifest.cc
   src/memtable.cc
   src/sstable.cc
   src/status.cc
