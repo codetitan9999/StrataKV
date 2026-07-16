@@ -45,6 +45,17 @@ if(STRATAKV_BUILD_TESTS)
 
   add_test(NAME stratakv_tests COMMAND stratakv_tests)
 
+  add_executable(stratakv_compaction_tests
+    tests/compaction_test.cc
+  )
+  target_link_libraries(stratakv_compaction_tests PRIVATE stratakv)
+  target_include_directories(stratakv_compaction_tests
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+
+  add_test(NAME stratakv_compaction_tests COMMAND stratakv_compaction_tests)
+
   add_executable(stratakv_manifest_tests
     tests/manifest_test.cc
   )
