@@ -16,6 +16,7 @@ namespace {
 
 enum class ManifestRecordType : std::uint8_t {
   kTableAdded = 1,
+  kTableDeleted = 2,
 };
 
 template <typename UInt>
@@ -70,6 +71,13 @@ Status ValidateTableMetadata(const TableMetadata& metadata) {
   return Status::OK();
 }
 
+Status ValidateFileNumber(std::uint64_t file_number) {
+  if (file_number == 0) {
+    return Status::InvalidArgument("manifest table file number must be nonzero");
+  }
+  return Status::OK();
+}
+
 Status EncodeTableAdded(const TableMetadata& metadata, std::string* payload) {
   Status valid = ValidateTableMetadata(metadata);
   if (!valid.ok()) {
@@ -97,26 +105,61 @@ Status EncodeTableAdded(const TableMetadata& metadata, std::string* payload) {
   return Status::OK();
 }
 
-Status DecodeRecord(std::string_view payload, TableMetadata* metadata) {
+Status EncodeTableDeleted(std::uint64_t file_number, std::string* payload) {
+  Status valid = ValidateFileNumber(file_number);
+  if (!valid.ok()) {
+    return valid;
+  }
+
+  payload->clear();
+  AppendFixed<std::uint8_t>(
+      *payload, static_cast<std::uint8_t>(ManifestRecordType::kTableDeleted));
+  AppendFixed<std::uint64_t>(*payload, file_number);
+  return Status::OK();
+}
+
+Status DecodeRecord(std::string_view payload, ManifestEdit* edit) {
   std::size_t offset = 0;
   std::uint8_t type = 0;
+
+  if (!ReadFixed(payload, &offset, &type)) {
+    return Status::Corruption("short manifest record");
+  }
+
+  if (type == static_cast<std::uint8_t>(ManifestRecordType::kTableDeleted)) {
+    std::uint64_t file_number = 0;
+    if (!ReadFixed(payload, &offset, &file_number)) {
+      return Status::Corruption("short manifest table deletion record");
+    }
+    if (offset != payload.size()) {
+      return Status::Corruption("manifest deletion record length mismatch");
+    }
+
+    Status valid = ValidateFileNumber(file_number);
+    if (!valid.ok()) {
+      return valid;
+    }
+    edit->type = ManifestEditType::kTableDeleted;
+    edit->file_number = file_number;
+    return Status::OK();
+  }
+
+  if (type != static_cast<std::uint8_t>(ManifestRecordType::kTableAdded)) {
+    return Status::Corruption("invalid manifest record type");
+  }
+
   std::uint64_t file_number = 0;
   std::uint64_t entry_count = 0;
   std::uint64_t file_size_bytes = 0;
   std::uint32_t smallest_key_size = 0;
   std::uint32_t largest_key_size = 0;
 
-  if (!ReadFixed(payload, &offset, &type) ||
-      !ReadFixed(payload, &offset, &file_number) ||
+  if (!ReadFixed(payload, &offset, &file_number) ||
       !ReadFixed(payload, &offset, &entry_count) ||
       !ReadFixed(payload, &offset, &file_size_bytes) ||
       !ReadFixed(payload, &offset, &smallest_key_size) ||
       !ReadFixed(payload, &offset, &largest_key_size)) {
     return Status::Corruption("short manifest record");
-  }
-
-  if (type != static_cast<std::uint8_t>(ManifestRecordType::kTableAdded)) {
-    return Status::Corruption("invalid manifest record type");
   }
 
   const std::uint64_t expected_size =
@@ -125,13 +168,15 @@ Status DecodeRecord(std::string_view payload, TableMetadata* metadata) {
     return Status::Corruption("manifest record length mismatch");
   }
 
-  metadata->file_number = file_number;
-  metadata->entry_count = entry_count;
-  metadata->file_size_bytes = file_size_bytes;
-  metadata->smallest_key.assign(payload.substr(offset, smallest_key_size));
+  edit->type = ManifestEditType::kTableAdded;
+  edit->file_number = file_number;
+  edit->table.file_number = file_number;
+  edit->table.entry_count = entry_count;
+  edit->table.file_size_bytes = file_size_bytes;
+  edit->table.smallest_key.assign(payload.substr(offset, smallest_key_size));
   offset += smallest_key_size;
-  metadata->largest_key.assign(payload.substr(offset, largest_key_size));
-  return ValidateTableMetadata(*metadata);
+  edit->table.largest_key.assign(payload.substr(offset, largest_key_size));
+  return ValidateTableMetadata(edit->table);
 }
 
 }  // namespace
@@ -174,6 +219,27 @@ Status ManifestWriter::AppendTable(const TableMetadata& metadata) {
   return Status::OK();
 }
 
+Status ManifestWriter::DeleteTable(std::uint64_t file_number) {
+  std::string payload;
+  Status encode_status = EncodeTableDeleted(file_number, &payload);
+  if (!encode_status.ok()) {
+    return encode_status;
+  }
+
+  std::string header;
+  AppendFixed<std::uint32_t>(header,
+                             static_cast<std::uint32_t>(payload.size()));
+  AppendFixed<std::uint32_t>(header, Checksum(payload));
+
+  stream_.write(header.data(), static_cast<std::streamsize>(header.size()));
+  stream_.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+  if (!stream_) {
+    return Status::IOError("failed to append manifest deletion record");
+  }
+
+  return Status::OK();
+}
+
 Status ManifestWriter::Sync() {
   stream_.flush();
   if (!stream_) {
@@ -186,7 +252,7 @@ ManifestReader::ManifestReader(std::filesystem::path path)
     : path_(std::move(path)) {}
 
 Status ManifestReader::Replay(
-    const std::function<Status(const TableMetadata&)>& apply_table) const {
+    const std::function<Status(const ManifestEdit&)>& apply) const {
   if (!std::filesystem::exists(path_)) {
     return Status::OK();
   }
@@ -226,13 +292,13 @@ Status ManifestReader::Replay(
       return Status::Corruption("manifest checksum mismatch");
     }
 
-    TableMetadata metadata;
-    Status decode_status = DecodeRecord(payload, &metadata);
+    ManifestEdit edit;
+    Status decode_status = DecodeRecord(payload, &edit);
     if (!decode_status.ok()) {
       return decode_status;
     }
 
-    Status apply_status = apply_table(metadata);
+    Status apply_status = apply(edit);
     if (!apply_status.ok()) {
       return apply_status;
     }

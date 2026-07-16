@@ -3,17 +3,18 @@
 #include <filesystem>
 #include <vector>
 
+#include "record.h"
 #include "sstable.h"
 #include "stratakv/status.h"
 
 namespace stratakv {
 
 struct CompactionInput {
-  std::vector<TableMetadata> tables;
+  std::vector<const SSTableReader*> tables;
 };
 
 struct CompactionOutput {
-  std::vector<TableMetadata> tables;
+  std::vector<TableEntry> entries;
 };
 
 class CompactionJob {

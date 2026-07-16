@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -84,8 +85,11 @@ void ReplaysAppendedTables(TestRunner* runner) {
 
   std::vector<std::uint64_t> file_numbers;
   stratakv::ManifestReader reader(manifest_path);
-  runner->ExpectOk(reader.Replay([&](const stratakv::TableMetadata& metadata) {
-                     file_numbers.push_back(metadata.file_number);
+  runner->ExpectOk(reader.Replay([&](const stratakv::ManifestEdit& edit) {
+                     runner->Expect(
+                         edit.type == stratakv::ManifestEditType::kTableAdded,
+                         "manifest edit should be table-added");
+                     file_numbers.push_back(edit.file_number);
                      return stratakv::Status::OK();
                    }),
                    "replay manifest");
@@ -103,6 +107,45 @@ void RejectsInvalidMetadata(TestRunner* runner) {
   const stratakv::Status status = writer.AppendTable(metadata);
   runner->Expect(status.code() == stratakv::Status::Code::kInvalidArgument,
                  "manifest should reject invalid file numbers");
+}
+
+void ReplaysTableDeletions(TestRunner* runner) {
+  TempDir dir;
+  const auto manifest_path = dir.path() / "MANIFEST";
+
+  stratakv::ManifestWriter writer(manifest_path);
+  runner->ExpectOk(writer.Open(/*append=*/false), "open manifest writer");
+  runner->ExpectOk(writer.AppendTable(Metadata(1, "a", "c")),
+                   "append first table");
+  runner->ExpectOk(writer.AppendTable(Metadata(2, "d", "f")),
+                   "append second table");
+  runner->ExpectOk(writer.DeleteTable(1), "delete first table");
+  runner->ExpectOk(writer.Sync(), "sync manifest");
+
+  std::map<std::uint64_t, bool> active;
+  stratakv::ManifestReader reader(manifest_path);
+  runner->ExpectOk(reader.Replay([&](const stratakv::ManifestEdit& edit) {
+                     if (edit.type == stratakv::ManifestEditType::kTableAdded) {
+                       active[edit.file_number] = true;
+                     } else {
+                       active.erase(edit.file_number);
+                     }
+                     return stratakv::Status::OK();
+                   }),
+                   "replay manifest with deletion");
+
+  runner->Expect(active.size() == 1 && active.count(2) == 1,
+                 "manifest deletion should remove table one");
+}
+
+void RejectsInvalidDeletions(TestRunner* runner) {
+  TempDir dir;
+  stratakv::ManifestWriter writer(dir.path() / "MANIFEST");
+  runner->ExpectOk(writer.Open(/*append=*/false), "open manifest writer");
+
+  const stratakv::Status status = writer.DeleteTable(0);
+  runner->Expect(status.code() == stratakv::Status::Code::kInvalidArgument,
+                 "manifest should reject invalid table deletions");
 }
 
 void DetectsChecksumMismatch(TestRunner* runner) {
@@ -129,7 +172,7 @@ void DetectsChecksumMismatch(TestRunner* runner) {
 
   stratakv::ManifestReader reader(manifest_path);
   const stratakv::Status status =
-      reader.Replay([](const stratakv::TableMetadata&) {
+      reader.Replay([](const stratakv::ManifestEdit&) {
         return stratakv::Status::OK();
       });
   runner->Expect(status.code() == stratakv::Status::Code::kCorruption,
@@ -142,6 +185,8 @@ int main() {
   TestRunner runner;
   ReplaysAppendedTables(&runner);
   RejectsInvalidMetadata(&runner);
+  ReplaysTableDeletions(&runner);
+  RejectsInvalidDeletions(&runner);
   DetectsChecksumMismatch(&runner);
   return runner.Finish();
 }

@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "compaction.h"
 #include "manifest.h"
 #include "memtable.h"
 #include "record.h"
@@ -242,12 +243,12 @@ class DBImpl final : public DB {
     }
 
     for (auto it = tables_.rbegin(); it != tables_.rend(); ++it) {
-      const TableMetadata& metadata = (*it)->metadata();
+      const TableMetadata& metadata = it->reader->metadata();
       if (key < metadata.smallest_key || key > metadata.largest_key) {
         continue;
       }
 
-      const TableLookup table_lookup = (*it)->Lookup(key);
+      const TableLookup table_lookup = it->reader->Lookup(key);
       if (!table_lookup.found) {
         continue;
       }
@@ -268,7 +269,7 @@ class DBImpl final : public DB {
 
     std::map<std::string, std::string> visible;
     for (const auto& table : tables_) {
-      for (const TableEntry& entry : table->entries()) {
+      for (const TableEntry& entry : table.reader->entries()) {
         if (entry.type == RecordType::kDelete) {
           visible.erase(entry.key);
         } else {
@@ -295,11 +296,33 @@ class DBImpl final : public DB {
   }
 
  private:
+  struct TableState {
+    std::uint64_t file_number = 0;
+    std::unique_ptr<SSTableReader> reader;
+  };
+
   Status LoadTables() {
-    ManifestReader reader(manifest_path_);
-    return reader.Replay([this](const TableMetadata& manifest_metadata) {
-      const std::filesystem::path path =
-          TablePath(table_dir_, manifest_metadata.file_number);
+    std::map<std::uint64_t, TableMetadata> active_tables;
+    ManifestReader manifest_reader(manifest_path_);
+    Status replay_status =
+        manifest_reader.Replay([&](const ManifestEdit& edit) {
+          if (edit.type == ManifestEditType::kTableDeleted) {
+            active_tables.erase(edit.file_number);
+            next_file_number_ =
+                std::max(next_file_number_, edit.file_number + 1);
+            return Status::OK();
+          }
+
+          active_tables[edit.file_number] = edit.table;
+          next_file_number_ = std::max(next_file_number_, edit.file_number + 1);
+          return Status::OK();
+        });
+    if (!replay_status.ok()) {
+      return replay_status;
+    }
+
+    for (const auto& [file_number, manifest_metadata] : active_tables) {
+      const std::filesystem::path path = TablePath(table_dir_, file_number);
       auto [table_reader, status] = SSTableReader::Open(path);
       if (!status.ok()) {
         return status;
@@ -314,11 +337,10 @@ class DBImpl final : public DB {
                                   path.string());
       }
 
-      next_file_number_ =
-          std::max(next_file_number_, manifest_metadata.file_number + 1);
-      tables_.push_back(std::move(table_reader));
-      return Status::OK();
-    });
+      tables_.push_back(TableState{file_number, std::move(table_reader)});
+    }
+
+    return Status::OK();
   }
 
   Status Recover() {
@@ -387,7 +409,7 @@ class DBImpl final : public DB {
     if (!open_status.ok()) {
       return open_status;
     }
-    tables_.push_back(std::move(reader));
+    tables_.push_back(TableState{file_number, std::move(reader)});
 
     Status wal_status = ResetWal();
     if (!wal_status.ok()) {
@@ -395,6 +417,102 @@ class DBImpl final : public DB {
     }
 
     memtable_.Clear();
+    return MaybeCompactTables();
+  }
+
+  Status MaybeCompactTables() {
+    if (options_.level0_compaction_trigger == 0 ||
+        tables_.size() < options_.level0_compaction_trigger ||
+        tables_.size() < 2) {
+      return Status::OK();
+    }
+
+    return CompactTables();
+  }
+
+  Status CompactTables() {
+    std::vector<std::uint64_t> old_file_numbers;
+    old_file_numbers.reserve(tables_.size());
+
+    CompactionInput input;
+    input.tables.reserve(tables_.size());
+    for (const TableState& table : tables_) {
+      old_file_numbers.push_back(table.file_number);
+      input.tables.push_back(table.reader.get());
+    }
+
+    CompactionOutput output;
+    CompactionJob job(db_path_);
+    Status compaction_status = job.Run(input, &output);
+    if (!compaction_status.ok()) {
+      return compaction_status;
+    }
+
+    std::vector<TableState> next_tables;
+    if (!output.entries.empty()) {
+      const std::uint64_t file_number = next_file_number_++;
+      const std::filesystem::path final_path =
+          TablePath(table_dir_, file_number);
+      const std::filesystem::path temporary_path =
+          final_path.string() + ".tmp";
+
+      SSTableBuilder builder(temporary_path);
+      for (const TableEntry& entry : output.entries) {
+        Status add_status =
+            entry.type == RecordType::kDelete
+                ? builder.AddDeletion(entry.key)
+                : builder.Add(entry.key, entry.value);
+        if (!add_status.ok()) {
+          return add_status;
+        }
+      }
+
+      TableMetadata metadata;
+      Status finish_status = builder.Finish(&metadata);
+      if (!finish_status.ok()) {
+        return finish_status;
+      }
+      metadata.file_number = file_number;
+      metadata.file_path = final_path;
+
+      std::error_code ec;
+      std::filesystem::rename(temporary_path, final_path, ec);
+      if (ec) {
+        return Status::IOError("failed to install compacted SSTable " +
+                               final_path.string() + ": " + ec.message());
+      }
+
+      auto [reader, open_status] = SSTableReader::Open(final_path);
+      if (!open_status.ok()) {
+        return open_status;
+      }
+
+      Status manifest_status = manifest_->AppendTable(metadata);
+      if (!manifest_status.ok()) {
+        return manifest_status;
+      }
+
+      next_tables.push_back(TableState{file_number, std::move(reader)});
+    }
+
+    for (std::uint64_t file_number : old_file_numbers) {
+      Status manifest_status = manifest_->DeleteTable(file_number);
+      if (!manifest_status.ok()) {
+        return manifest_status;
+      }
+    }
+
+    Status manifest_status = manifest_->Sync();
+    if (!manifest_status.ok()) {
+      return manifest_status;
+    }
+
+    for (std::uint64_t file_number : old_file_numbers) {
+      std::error_code ec;
+      std::filesystem::remove(TablePath(table_dir_, file_number), ec);
+    }
+
+    tables_ = std::move(next_tables);
     return Status::OK();
   }
 
@@ -426,7 +544,7 @@ class DBImpl final : public DB {
 
   mutable std::mutex mu_;
   MemTable memtable_;
-  std::vector<std::unique_ptr<SSTableReader>> tables_;
+  std::vector<TableState> tables_;
   std::uint64_t last_sequence_ = 0;
   std::uint64_t next_file_number_ = 1;
   std::unique_ptr<ManifestWriter> manifest_;
