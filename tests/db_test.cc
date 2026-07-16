@@ -288,6 +288,89 @@ void MissingManifestTableFailsOpen(TestRunner* runner) {
   runner->Expect(!status.ok(), "missing manifest-listed table should fail open");
 }
 
+void CompactsFlushedTables(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.level0_compaction_trigger = 3;
+
+  {
+    auto db = OpenOrFail(runner, dir.path(), options);
+    if (!db) {
+      return;
+    }
+
+    runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "c", "3"), "put c");
+    runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "a", "1"), "put a");
+    runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "b", "2"), "put b");
+
+    runner->Expect(CountSSTables(dir.path()) == 1,
+                   "compaction should replace three tables with one");
+
+    auto [value, status] = db->Get(stratakv::ReadOptions{}, "a");
+    runner->ExpectOk(status, "get compacted a");
+    runner->Expect(value == "1", "compacted a value");
+  }
+
+  auto reopened = OpenOrFail(runner, dir.path(), options);
+  if (!reopened) {
+    return;
+  }
+
+  std::vector<std::string> keys;
+  auto it = reopened->NewIterator(stratakv::ReadOptions{});
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    keys.emplace_back(it->key());
+  }
+
+  runner->Expect(keys == std::vector<std::string>({"a", "b", "c"}),
+                 "compacted table should reopen with sorted keys");
+}
+
+void CompactionDropsCoveredTombstones(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.level0_compaction_trigger = 3;
+
+  {
+    auto db = OpenOrFail(runner, dir.path(), options);
+    if (!db) {
+      return;
+    }
+
+    runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "alpha", "one"),
+                     "put alpha before compacted delete");
+    runner->ExpectOk(db->Delete(stratakv::WriteOptions{}, "alpha"),
+                     "delete alpha before compaction");
+    runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "beta", "two"),
+                     "put beta to trigger compaction");
+
+    runner->Expect(CountSSTables(dir.path()) == 1,
+                   "compaction should leave one live table");
+
+    auto [alpha, alpha_status] = db->Get(stratakv::ReadOptions{}, "alpha");
+    (void)alpha;
+    runner->Expect(alpha_status.code() == stratakv::Status::Code::kNotFound,
+                   "compaction should keep alpha deleted");
+  }
+
+  auto reopened = OpenOrFail(runner, dir.path(), options);
+  if (!reopened) {
+    return;
+  }
+
+  auto [alpha, alpha_status] =
+      reopened->Get(stratakv::ReadOptions{}, "alpha");
+  (void)alpha;
+  runner->Expect(alpha_status.code() == stratakv::Status::Code::kNotFound,
+                 "reopened compacted state should keep alpha deleted");
+
+  auto [beta, beta_status] = reopened->Get(stratakv::ReadOptions{}, "beta");
+  runner->ExpectOk(beta_status, "get beta after compacted reopen");
+  runner->Expect(beta == "two", "beta should survive compaction");
+}
+
 }  // namespace
 
 int main() {
@@ -299,5 +382,7 @@ int main() {
   FlushedTombstoneHidesOlderTableValue(&runner);
   IteratorMergesFlushedTables(&runner);
   MissingManifestTableFailsOpen(&runner);
+  CompactsFlushedTables(&runner);
+  CompactionDropsCoveredTombstones(&runner);
   return runner.Finish();
 }
