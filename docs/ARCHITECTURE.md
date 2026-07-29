@@ -27,6 +27,8 @@ The public API is deliberately small. It should remain stable while internals ev
 
 Current write order is WAL first, memtable second. When the memtable crosses the configured write buffer size, it is written to a numbered SSTable, recorded in the manifest, and then the WAL is rotated.
 
+WAL replay applies every complete record with a valid checksum. If a crash leaves a partial final header or payload, replay stops at the complete prefix. A full record with a checksum mismatch is treated as corruption.
+
 ### Read Path
 
 Reads follow this order:
@@ -72,6 +74,7 @@ The core invariants are:
 
 - Sequence numbers define write order.
 - WAL replay must reconstruct all acknowledged writes.
+- WAL recovery tolerates a torn final record but rejects checksummed data corruption.
 - Newer records shadow older records for the same key.
 - Tombstones shadow older values until compaction proves they are obsolete.
 - Installed SSTables must be discoverable after crash recovery.
@@ -108,7 +111,7 @@ Current tests cover:
 
 - Put/Get/Delete semantics
 - Iterator ordering and tombstone hiding
-- WAL replay across reopen
+- WAL replay across reopen, torn-tail recovery, and checksum corruption detection
 - SSTable round trips, sorted iteration, key ordering validation, and checksum corruption detection
 - Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
 - Manifest replay, invalid metadata rejection, checksum corruption detection, and missing table handling
@@ -116,7 +119,7 @@ Current tests cover:
 
 Next test layers should add:
 
-- WAL corruption and partial-record recovery behavior
+- WAL replay limits for very large records and injected I/O failures
 - Streaming iterator merge correctness across memtable and SSTables
 - Multi-level compaction correctness with overwritten keys and tombstones
 - Fault injection around file creation, rename, and manifest updates
