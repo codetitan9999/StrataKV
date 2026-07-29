@@ -1,0 +1,189 @@
+#include "wal.h"
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+
+namespace {
+
+class TempDir {
+ public:
+  TempDir() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    path_ = std::filesystem::temp_directory_path() /
+            ("stratakv-wal-test-" + std::to_string(now));
+    std::filesystem::create_directories(path_);
+  }
+
+  ~TempDir() {
+    std::error_code ec;
+    std::filesystem::remove_all(path_, ec);
+  }
+
+  const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path path_;
+};
+
+class TestRunner {
+ public:
+  void Expect(bool condition, const std::string& message) {
+    if (!condition) {
+      ++failures_;
+      std::cerr << "FAIL: " << message << '\n';
+    }
+  }
+
+  void ExpectOk(const stratakv::Status& status, const std::string& context) {
+    Expect(status.ok(), context + ": " + status.ToString());
+  }
+
+  int Finish() const {
+    if (failures_ == 0) {
+      std::cout << "All tests passed\n";
+      return 0;
+    }
+
+    std::cerr << failures_ << " test expectation(s) failed\n";
+    return 1;
+  }
+
+ private:
+  int failures_ = 0;
+};
+
+void AppendRecord(TestRunner* runner, const std::filesystem::path& path,
+                  const stratakv::LogRecord& record, bool append = true) {
+  stratakv::WalWriter writer(path);
+  runner->ExpectOk(writer.Open(append), "open WAL writer");
+  runner->ExpectOk(writer.Append(record), "append WAL record");
+  runner->ExpectOk(writer.Sync(), "sync WAL writer");
+}
+
+std::vector<stratakv::LogRecord> Replay(const std::filesystem::path& path,
+                                        stratakv::Status* status) {
+  std::vector<stratakv::LogRecord> records;
+  stratakv::WalReader reader(path);
+  *status = reader.Replay([&](const stratakv::LogRecord& record) {
+    records.push_back(record);
+    return stratakv::Status::OK();
+  });
+  return records;
+}
+
+void ReplaysCompleteRecords(TestRunner* runner) {
+  TempDir dir;
+  const auto path = dir.path() / "current.log";
+
+  AppendRecord(runner, path,
+               stratakv::LogRecord{stratakv::RecordType::kPut, 1, "alpha",
+                                    "one"},
+               /*append=*/false);
+  AppendRecord(runner, path,
+               stratakv::LogRecord{stratakv::RecordType::kDelete, 2, "beta",
+                                    ""},
+               /*append=*/true);
+
+  stratakv::Status status;
+  const auto records = Replay(path, &status);
+  runner->ExpectOk(status, "replay complete WAL");
+  runner->Expect(records.size() == 2, "two complete records should replay");
+  if (records.size() != 2) {
+    return;
+  }
+  runner->Expect(records[0].key == "alpha", "first record key");
+  runner->Expect(records[0].value == "one", "first record value");
+  runner->Expect(records[1].type == stratakv::RecordType::kDelete,
+                 "second record type");
+  runner->Expect(records[1].key == "beta", "second record key");
+}
+
+void IgnoresTornTrailingHeader(TestRunner* runner) {
+  TempDir dir;
+  const auto path = dir.path() / "current.log";
+
+  AppendRecord(runner, path,
+               stratakv::LogRecord{stratakv::RecordType::kPut, 1, "alpha",
+                                    "one"},
+               /*append=*/false);
+
+  std::ofstream stream(path, std::ios::binary | std::ios::app);
+  stream.write("abc", 3);
+  stream.close();
+  runner->Expect(!stream.fail(), "append torn WAL header");
+
+  stratakv::Status status;
+  const auto records = Replay(path, &status);
+  runner->ExpectOk(status, "replay WAL with torn trailing header");
+  runner->Expect(records.size() == 1, "torn header should not replay");
+  if (records.size() != 1) {
+    return;
+  }
+  runner->Expect(records[0].key == "alpha", "complete record survives");
+}
+
+void IgnoresTornTrailingPayload(TestRunner* runner) {
+  TempDir dir;
+  const auto path = dir.path() / "current.log";
+
+  AppendRecord(runner, path,
+               stratakv::LogRecord{stratakv::RecordType::kPut, 1, "alpha",
+                                    "one"},
+               /*append=*/false);
+  AppendRecord(runner, path,
+               stratakv::LogRecord{stratakv::RecordType::kPut, 2, "beta",
+                                    "two"},
+               /*append=*/true);
+
+  const auto size_before_truncation = std::filesystem::file_size(path);
+  std::filesystem::resize_file(path, size_before_truncation - 2);
+
+  stratakv::Status status;
+  const auto records = Replay(path, &status);
+  runner->ExpectOk(status, "replay WAL with torn trailing payload");
+  runner->Expect(records.size() == 1, "torn payload should not replay");
+  if (records.size() != 1) {
+    return;
+  }
+  runner->Expect(records[0].key == "alpha", "complete prefix survives");
+}
+
+void DetectsChecksumMismatch(TestRunner* runner) {
+  TempDir dir;
+  const auto path = dir.path() / "current.log";
+
+  AppendRecord(runner, path,
+               stratakv::LogRecord{stratakv::RecordType::kPut, 1, "alpha",
+                                    "one"},
+               /*append=*/false);
+
+  std::fstream stream(path, std::ios::binary | std::ios::in | std::ios::out);
+  char byte = 0;
+  stream.seekg(8);
+  stream.get(byte);
+  stream.seekp(8);
+  stream.put(static_cast<char>(byte ^ 0x01));
+  stream.close();
+  runner->Expect(!stream.fail(), "flip WAL payload byte");
+
+  stratakv::Status status;
+  const auto records = Replay(path, &status);
+  runner->Expect(status.code() == stratakv::Status::Code::kCorruption,
+                 "checksum mismatch should be corruption");
+  runner->Expect(records.empty(), "corrupt record should not replay");
+}
+
+}  // namespace
+
+int main() {
+  TestRunner runner;
+  ReplaysCompleteRecords(&runner);
+  IgnoresTornTrailingHeader(&runner);
+  IgnoresTornTrailingPayload(&runner);
+  DetectsChecksumMismatch(&runner);
+  return runner.Finish();
+}
