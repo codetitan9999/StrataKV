@@ -165,7 +165,8 @@ Status WalReader::Replay(
     }
 
     if (stream.gcount() != static_cast<std::streamsize>(header.size())) {
-      return Status::Corruption("truncated WAL record header");
+      // A crash can leave only part of the final WAL record on disk.
+      return Status::OK();
     }
 
     std::size_t header_offset = 0;
@@ -178,7 +179,8 @@ Status WalReader::Replay(
     std::string payload(payload_size, '\0');
     stream.read(payload.data(), static_cast<std::streamsize>(payload.size()));
     if (stream.gcount() != static_cast<std::streamsize>(payload.size())) {
-      return Status::Corruption("truncated WAL record payload");
+      // Replay the complete prefix and ignore a torn final payload.
+      return Status::OK();
     }
 
     if (Checksum(payload) != expected_checksum) {
