@@ -11,7 +11,7 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - Sorted in-memory memtable
 - Binary write-ahead log with per-record checksums
 - Delete tombstones
-- WAL replay on reopen
+- WAL replay on reopen, including torn-tail recovery
 - Single-block SSTable writer/reader with checksum validation
 - Memtable flush to SSTables with WAL rotation
 - Reads from both memtable and flushed SSTables
@@ -45,7 +45,7 @@ The write path is intentionally straightforward:
 5. A manifest record makes the new table discoverable on restart.
 6. The WAL is rotated after a successful flush.
 7. When enough flushed tables accumulate, compaction merges them into one table and records old tables as deleted.
-8. On restart, manifest-listed SSTables are loaded first, then the WAL is replayed.
+8. On restart, manifest-listed SSTables are loaded first, then the WAL is replayed up to the last complete record.
 
 The current database directory looks like this:
 
@@ -76,7 +76,7 @@ docs/               architecture notes
 
 - Multi-block SSTables with index blocks
 - Streaming range scans through merged iterators
-- Recovery and corruption tests
+- More recovery and corruption tests
 - Benchmarks for writes, reads, scans, recovery, and compaction
 
 ### Phase 2: Distributed Layer
