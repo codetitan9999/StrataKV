@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -167,6 +168,36 @@ void ReplaysWalOnReopen(TestRunner* runner) {
   auto [beta, beta_status] = db->Get(stratakv::ReadOptions{}, "beta");
   runner->ExpectOk(beta_status, "get beta after WAL replay");
   runner->Expect(beta == "two", "beta should survive reopen");
+}
+
+void IgnoresTornWalTailOnReopen(TestRunner* runner) {
+  TempDir dir;
+
+  {
+    auto db = OpenOrFail(runner, dir.path());
+    if (!db) {
+      return;
+    }
+
+    runner->ExpectOk(db->Put(stratakv::WriteOptions{.sync = true}, "alpha",
+                             "one"),
+                     "put alpha before torn WAL tail");
+  }
+
+  std::ofstream stream(dir.path() / "wal" / "current.log",
+                       std::ios::binary | std::ios::app);
+  stream.write("abc", 3);
+  stream.close();
+  runner->Expect(!stream.fail(), "append torn WAL tail");
+
+  auto db = OpenOrFail(runner, dir.path());
+  if (!db) {
+    return;
+  }
+
+  auto [value, status] = db->Get(stratakv::ReadOptions{}, "alpha");
+  runner->ExpectOk(status, "get alpha after torn WAL reopen");
+  runner->Expect(value == "one", "complete WAL record should survive");
 }
 
 void FlushesMemTableToSSTable(TestRunner* runner) {
@@ -378,6 +409,7 @@ int main() {
   PutGetDeleteRoundTrip(&runner);
   IteratorOrdersLiveKeys(&runner);
   ReplaysWalOnReopen(&runner);
+  IgnoresTornWalTailOnReopen(&runner);
   FlushesMemTableToSSTable(&runner);
   FlushedTombstoneHidesOlderTableValue(&runner);
   IteratorMergesFlushedTables(&runner);
