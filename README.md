@@ -12,7 +12,7 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - Binary write-ahead log with per-record checksums
 - Delete tombstones
 - WAL replay on reopen, including torn-tail recovery
-- Single-block SSTable writer/reader with checksum validation
+- Multi-block SSTables with per-block checksums and an on-disk index
 - Memtable flush to SSTables with WAL rotation
 - Reads from both memtable and flushed SSTables
 - Manifest file with checksummed table metadata records

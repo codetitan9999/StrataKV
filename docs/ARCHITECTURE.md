@@ -41,14 +41,24 @@ Deletes are tombstones, not immediate removals from history. Compaction decides 
 
 ### SSTables
 
-`src/sstable.*` implements the first immutable sorted table format. The current format stores one sorted data block and a fixed footer:
+`src/sstable.*` implements the immutable sorted table format. Writers split
+sorted entries into target-sized data blocks. Each data block has its own
+checksum, and an index maps each block's largest key to its byte range:
 
 ```text
-data block: repeated sorted key/value entries
-footer: entry count, data block size, checksum, magic
+data block 0: repeated sorted key/value entries, checksum
+data block 1: repeated sorted key/value entries, checksum
+...
+index block: largest key, block offset, block size, entry count
+footer: total entry count, index location, index checksum, format magic
 ```
 
-The reader verifies the data-block checksum before decoding entries, rejects unsorted or malformed tables, supports binary-search point lookups, and exposes an iterator. Multi-block tables, index blocks, and prefix compression remain future work.
+The reader verifies the index and every data-block checksum, rejects invalid
+block ranges, unsorted keys, and mismatches between the index and data. It
+supports binary-search point lookups and exposes an iterator. Readers retain
+compatibility with the original single-block `STKV0001` format, while new
+tables use the indexed `STKV0002` format. Lazy block reads, block caching, and
+prefix compression remain future work.
 
 ### Compaction
 
@@ -113,6 +123,7 @@ Current tests cover:
 - Iterator ordering and tombstone hiding
 - WAL replay across reopen, torn-tail recovery, and checksum corruption detection
 - SSTable round trips, sorted iteration, key ordering validation, and checksum corruption detection
+- Multi-block SSTable boundaries, index corruption, and legacy format compatibility
 - Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
 - Manifest replay, invalid metadata rejection, checksum corruption detection, and missing table handling
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
@@ -151,8 +162,8 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 2: SSTable Format
 
-- Add multi-block tables and index blocks
-- Add golden tests for table encoding
+- Add lazy block reads and a block cache
+- Add prefix compression and golden encoding tests
 
 ### Milestone 3: Flush and Recovery
 
