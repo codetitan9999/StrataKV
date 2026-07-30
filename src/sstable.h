@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -37,7 +38,8 @@ struct TableLookup {
 
 class SSTableBuilder {
  public:
-  explicit SSTableBuilder(std::filesystem::path path);
+  explicit SSTableBuilder(std::filesystem::path path,
+                          std::size_t target_block_size = 4096);
 
   Status Add(std::string_view key, std::string_view value);
   Status AddDeletion(std::string_view key);
@@ -48,6 +50,7 @@ class SSTableBuilder {
                      std::string_view value);
 
   std::filesystem::path path_;
+  std::size_t target_block_size_;
   std::vector<TableEntry> entries_;
   std::string last_key_;
   bool has_last_key_ = false;

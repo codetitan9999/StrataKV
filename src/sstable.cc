@@ -16,9 +16,21 @@
 namespace stratakv {
 namespace {
 
-constexpr std::string_view kMagic = "STKV0001";
+constexpr std::string_view kMagic = "STKV0002";
+constexpr std::string_view kLegacyMagic = "STKV0001";
 constexpr std::size_t kFooterSize =
+    sizeof(std::uint64_t) + sizeof(std::uint64_t) + sizeof(std::uint64_t) +
+    sizeof(std::uint32_t) + 8;
+constexpr std::size_t kLegacyFooterSize =
     sizeof(std::uint64_t) + sizeof(std::uint64_t) + sizeof(std::uint32_t) + 8;
+constexpr std::size_t kBlockTrailerSize = sizeof(std::uint32_t);
+
+struct BlockIndexEntry {
+  std::string last_key;
+  std::uint64_t offset = 0;
+  std::uint64_t size = 0;
+  std::uint64_t entry_count = 0;
+};
 
 template <typename UInt>
 void AppendFixed(std::string& out, UInt value) {
@@ -135,6 +147,55 @@ Status DecodeEntries(std::string_view data_block, std::uint64_t entry_count,
   return Status::OK();
 }
 
+Status DecodeBlock(std::string_view block, std::uint64_t entry_count,
+                   std::vector<TableEntry>* out) {
+  if (block.size() < kBlockTrailerSize) {
+    return Status::Corruption("SSTable data block is smaller than trailer");
+  }
+  const std::string_view data = block.substr(0, block.size() - kBlockTrailerSize);
+  std::size_t trailer_offset = data.size();
+  std::uint32_t expected_checksum = 0;
+  if (!ReadFixed(block, &trailer_offset, &expected_checksum)) {
+    return Status::Corruption("short SSTable data block trailer");
+  }
+  if (Checksum(data) != expected_checksum) {
+    return Status::Corruption("SSTable data block checksum mismatch");
+  }
+  return DecodeEntries(data, entry_count, out);
+}
+
+Status DecodeIndex(std::string_view index, std::vector<BlockIndexEntry>* out) {
+  std::size_t offset = 0;
+  out->clear();
+  while (offset < index.size()) {
+    std::uint32_t key_size = 0;
+    BlockIndexEntry entry;
+    if (!ReadFixed(index, &offset, &key_size) ||
+        static_cast<std::uint64_t>(offset) + key_size > index.size()) {
+      return Status::Corruption("short SSTable index key");
+    }
+    entry.last_key = std::string(index.substr(offset, key_size));
+    offset += key_size;
+    if (!ReadFixed(index, &offset, &entry.offset) ||
+        !ReadFixed(index, &offset, &entry.size) ||
+        !ReadFixed(index, &offset, &entry.entry_count)) {
+      return Status::Corruption("short SSTable index entry");
+    }
+    if (entry.last_key.empty() || entry.size < kBlockTrailerSize ||
+        entry.entry_count == 0) {
+      return Status::Corruption("invalid SSTable index entry");
+    }
+    if (!out->empty() && out->back().last_key >= entry.last_key) {
+      return Status::Corruption("SSTable index keys are not strictly sorted");
+    }
+    out->push_back(std::move(entry));
+  }
+  if (out->empty()) {
+    return Status::Corruption("SSTable index is empty");
+  }
+  return Status::OK();
+}
+
 class SSTableIterator final : public Iterator {
  public:
   explicit SSTableIterator(std::vector<std::pair<std::string, std::string>> rows)
@@ -180,8 +241,10 @@ class SSTableIterator final : public Iterator {
 
 }  // namespace
 
-SSTableBuilder::SSTableBuilder(std::filesystem::path path)
-    : path_(std::move(path)) {}
+SSTableBuilder::SSTableBuilder(std::filesystem::path path,
+                               std::size_t target_block_size)
+    : path_(std::move(path)),
+      target_block_size_(std::max<std::size_t>(target_block_size, 1)) {}
 
 Status SSTableBuilder::Add(std::string_view key, std::string_view value) {
   return AddInternal(RecordType::kPut, key, value);
@@ -228,21 +291,67 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
     return Status::InvalidArgument("cannot finish an empty SSTable");
   }
 
+  std::string file;
   std::string data_block;
+  std::vector<BlockIndexEntry> index_entries;
+  std::uint64_t block_entry_count = 0;
+  std::size_t entries_written = 0;
+
+  const auto finish_block = [&]() {
+    if (block_entry_count == 0) {
+      return;
+    }
+    BlockIndexEntry index_entry;
+    index_entry.last_key = entries_[entries_written - 1].key;
+    index_entry.offset = static_cast<std::uint64_t>(file.size());
+    index_entry.size =
+        static_cast<std::uint64_t>(data_block.size() + kBlockTrailerSize);
+    index_entry.entry_count = block_entry_count;
+    file.append(data_block);
+    AppendFixed<std::uint32_t>(file, Checksum(data_block));
+    index_entries.push_back(std::move(index_entry));
+    data_block.clear();
+    block_entry_count = 0;
+  };
+
   for (const auto& entry : entries_) {
-    Status encode_status = EncodeEntry(data_block, entry);
+    std::string encoded;
+    Status encode_status = EncodeEntry(encoded, entry);
     if (!encode_status.ok()) {
       return encode_status;
     }
+    if (!data_block.empty() &&
+        data_block.size() + encoded.size() > target_block_size_) {
+      finish_block();
+    }
+    data_block.append(encoded);
+    ++block_entry_count;
+    ++entries_written;
+    if (data_block.size() >= target_block_size_) {
+      finish_block();
+    }
   }
+  finish_block();
 
+  const std::uint64_t index_offset = static_cast<std::uint64_t>(file.size());
+  std::string index_block;
+  for (const BlockIndexEntry& entry : index_entries) {
+    AppendFixed<std::uint32_t>(
+        index_block, static_cast<std::uint32_t>(entry.last_key.size()));
+    index_block.append(entry.last_key);
+    AppendFixed<std::uint64_t>(index_block, entry.offset);
+    AppendFixed<std::uint64_t>(index_block, entry.size);
+    AppendFixed<std::uint64_t>(index_block, entry.entry_count);
+  }
+  file.append(index_block);
   std::string footer;
   footer.reserve(kFooterSize);
   AppendFixed<std::uint64_t>(footer,
                              static_cast<std::uint64_t>(entries_.size()));
+  AppendFixed<std::uint64_t>(footer, index_offset);
   AppendFixed<std::uint64_t>(footer,
-                             static_cast<std::uint64_t>(data_block.size()));
-  AppendFixed<std::uint32_t>(footer, Checksum(data_block));
+                             static_cast<std::uint64_t>(index_block.size()));
+  AppendFixed<std::uint32_t>(footer, Checksum(index_block));
   footer.append(kMagic);
 
   std::ofstream stream(path_, std::ios::binary | std::ios::out |
@@ -252,8 +361,7 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
                            path_.string());
   }
 
-  stream.write(data_block.data(),
-               static_cast<std::streamsize>(data_block.size()));
+  stream.write(file.data(), static_cast<std::streamsize>(file.size()));
   stream.write(footer.data(), static_cast<std::streamsize>(footer.size()));
   stream.flush();
 
@@ -266,7 +374,7 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
   metadata->largest_key = entries_.back().key;
   metadata->entry_count = static_cast<std::uint64_t>(entries_.size());
   metadata->file_size_bytes =
-      static_cast<std::uint64_t>(data_block.size() + footer.size());
+      static_cast<std::uint64_t>(file.size() + footer.size());
 
   finished_ = true;
   return Status::OK();
@@ -282,7 +390,7 @@ std::pair<std::unique_ptr<SSTableReader>, Status> SSTableReader::Open(
   }
 
   const std::streamoff file_size = stream.tellg();
-  if (file_size < static_cast<std::streamoff>(kFooterSize)) {
+  if (file_size < static_cast<std::streamoff>(kLegacyFooterSize)) {
     return {nullptr, Status::Corruption("SSTable is smaller than footer")};
   }
 
@@ -294,16 +402,63 @@ std::pair<std::unique_ptr<SSTableReader>, Status> SSTableReader::Open(
             Status::IOError("failed to read SSTable: " + path.string())};
   }
 
+  if (std::string_view(file).substr(file.size() - kLegacyMagic.size()) ==
+      kLegacyMagic) {
+    const std::string_view legacy_footer(
+        file.data() +
+            file.size() - static_cast<std::ptrdiff_t>(kLegacyFooterSize),
+        kLegacyFooterSize);
+    std::size_t offset = 0;
+    std::uint64_t legacy_entry_count = 0;
+    std::uint64_t data_size = 0;
+    std::uint32_t data_checksum = 0;
+    if (!ReadFixed(legacy_footer, &offset, &legacy_entry_count) ||
+        !ReadFixed(legacy_footer, &offset, &data_size) ||
+        !ReadFixed(legacy_footer, &offset, &data_checksum) ||
+        data_size + kLegacyFooterSize != file.size()) {
+      return {nullptr, Status::Corruption("invalid legacy SSTable footer")};
+    }
+    const std::string_view data(file.data(),
+                                static_cast<std::size_t>(data_size));
+    if (Checksum(data) != data_checksum) {
+      return {nullptr,
+              Status::Corruption("SSTable data block checksum mismatch")};
+    }
+    std::vector<TableEntry> legacy_entries;
+    Status decode_status =
+        DecodeEntries(data, legacy_entry_count, &legacy_entries);
+    if (!decode_status.ok()) {
+      return {nullptr, decode_status};
+    }
+    TableMetadata legacy_metadata;
+    legacy_metadata.file_path = path;
+    legacy_metadata.entry_count = legacy_entry_count;
+    legacy_metadata.file_size_bytes = static_cast<std::uint64_t>(file.size());
+    if (!legacy_entries.empty()) {
+      legacy_metadata.smallest_key = legacy_entries.front().key;
+      legacy_metadata.largest_key = legacy_entries.back().key;
+    }
+    return {std::unique_ptr<SSTableReader>(new SSTableReader(
+                path, std::move(legacy_entries), legacy_metadata)),
+            Status::OK()};
+  }
+
+  if (file.size() < kFooterSize) {
+    return {nullptr, Status::Corruption("SSTable is smaller than footer")};
+  }
+
   const std::string_view footer(
       file.data() + file.size() - static_cast<std::ptrdiff_t>(kFooterSize),
       kFooterSize);
   std::size_t footer_offset = 0;
   std::uint64_t entry_count = 0;
-  std::uint64_t data_block_size = 0;
+  std::uint64_t index_offset = 0;
+  std::uint64_t index_size = 0;
   std::uint32_t expected_checksum = 0;
 
   if (!ReadFixed(footer, &footer_offset, &entry_count) ||
-      !ReadFixed(footer, &footer_offset, &data_block_size) ||
+      !ReadFixed(footer, &footer_offset, &index_offset) ||
+      !ReadFixed(footer, &footer_offset, &index_size) ||
       !ReadFixed(footer, &footer_offset, &expected_checksum)) {
     return {nullptr, Status::Corruption("short SSTable footer")};
   }
@@ -312,20 +467,56 @@ std::pair<std::unique_ptr<SSTableReader>, Status> SSTableReader::Open(
     return {nullptr, Status::Corruption("SSTable footer magic mismatch")};
   }
 
-  if (data_block_size + kFooterSize != file.size()) {
-    return {nullptr, Status::Corruption("SSTable data block size mismatch")};
+  if (index_offset > file.size() - kFooterSize ||
+      index_size != file.size() - kFooterSize - index_offset) {
+    return {nullptr, Status::Corruption("SSTable index bounds mismatch")};
   }
 
-  const std::string_view data_block(file.data(),
-                                    static_cast<std::size_t>(data_block_size));
-  if (Checksum(data_block) != expected_checksum) {
-    return {nullptr, Status::Corruption("SSTable data block checksum mismatch")};
+  const std::string_view index_block(
+      file.data() + static_cast<std::ptrdiff_t>(index_offset),
+      static_cast<std::size_t>(index_size));
+  if (Checksum(index_block) != expected_checksum) {
+    return {nullptr, Status::Corruption("SSTable index checksum mismatch")};
+  }
+
+  std::vector<BlockIndexEntry> index_entries;
+  Status index_status = DecodeIndex(index_block, &index_entries);
+  if (!index_status.ok()) {
+    return {nullptr, index_status};
   }
 
   std::vector<TableEntry> entries;
-  Status decode_status = DecodeEntries(data_block, entry_count, &entries);
-  if (!decode_status.ok()) {
-    return {nullptr, decode_status};
+  entries.reserve(static_cast<std::size_t>(entry_count));
+  std::uint64_t decoded_entry_count = 0;
+  std::uint64_t expected_offset = 0;
+  for (const BlockIndexEntry& index_entry : index_entries) {
+    if (index_entry.offset != expected_offset ||
+        index_entry.offset > index_offset ||
+        index_entry.size > index_offset - index_entry.offset) {
+      return {nullptr, Status::Corruption("SSTable data block bounds mismatch")};
+    }
+    const std::string_view block(
+        file.data() + static_cast<std::ptrdiff_t>(index_entry.offset),
+        static_cast<std::size_t>(index_entry.size));
+    std::vector<TableEntry> block_entries;
+    Status decode_status =
+        DecodeBlock(block, index_entry.entry_count, &block_entries);
+    if (!decode_status.ok()) {
+      return {nullptr, decode_status};
+    }
+    if (block_entries.back().key != index_entry.last_key ||
+        (!entries.empty() && entries.back().key >= block_entries.front().key)) {
+      return {nullptr,
+              Status::Corruption("SSTable index does not match data blocks")};
+    }
+    decoded_entry_count += index_entry.entry_count;
+    entries.insert(entries.end(),
+                   std::make_move_iterator(block_entries.begin()),
+                   std::make_move_iterator(block_entries.end()));
+    expected_offset += index_entry.size;
+  }
+  if (expected_offset != index_offset || decoded_entry_count != entry_count) {
+    return {nullptr, Status::Corruption("SSTable entry count mismatch")};
   }
 
   TableMetadata metadata;
