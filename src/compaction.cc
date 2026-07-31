@@ -20,7 +20,11 @@ Status CompactionJob::Run(const CompactionInput& input,
       return Status::InvalidArgument("compaction input table must not be null");
     }
 
-    for (const TableEntry& entry : table->entries()) {
+    auto [entries, read_status] = table->ReadAll();
+    if (!read_status.ok()) {
+      return read_status;
+    }
+    for (const TableEntry& entry : entries) {
       if (entry.type == RecordType::kDelete) {
         live_values.erase(entry.key);
       } else {

@@ -15,6 +15,10 @@ struct Options {
   // Kept in the public options now so table cache design has a stable home.
   std::size_t max_open_files = 512;
 
+  // Maximum decoded SSTable data-block bytes retained per open table.
+  // A value of 0 disables block caching while preserving lazy reads.
+  std::size_t block_cache_size = 8 * 1024 * 1024;
+
   // Number of flushed SSTables that triggers a full single-level compaction.
   // A value of 0 disables automatic compaction.
   std::size_t level0_compaction_trigger = 4;

@@ -8,6 +8,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -48,7 +49,10 @@ int main(int argc, char** argv) {
   }
 
   const auto db_path = FreshBenchDir();
-  auto [db, open_status] = stratakv::DB::Open(stratakv::Options{}, db_path);
+  stratakv::Options options;
+  options.write_buffer_size = 64 * 1024;
+  options.block_cache_size = 8 * 1024 * 1024;
+  auto [db, open_status] = stratakv::DB::Open(options, db_path);
   if (!open_status.ok()) {
     std::cerr << "open failed: " << open_status << '\n';
     return 1;
@@ -64,6 +68,13 @@ int main(int argc, char** argv) {
     }
   }
   const auto write_duration = Clock::now() - write_start;
+
+  db.reset();
+  std::tie(db, open_status) = stratakv::DB::Open(options, db_path);
+  if (!open_status.ok()) {
+    std::cerr << "reopen failed: " << open_status << '\n';
+    return 1;
+  }
 
   std::vector<std::size_t> order(operations);
   std::iota(order.begin(), order.end(), 0);
@@ -100,6 +111,8 @@ int main(int argc, char** argv) {
   std::cout << "StrataKV local benchmark\n";
   std::cout << "path: " << db_path << '\n';
   std::cout << "operations: " << operations << '\n';
+  std::cout << "read source: reopened SSTables + final WAL tail\n";
+  std::cout << "block cache: " << options.block_cache_size << " bytes/table\n";
   std::cout << "put throughput: "
             << operations / Seconds(write_duration) << " ops/sec\n";
   std::cout << "get throughput: "

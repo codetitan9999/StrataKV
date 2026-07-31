@@ -51,8 +51,9 @@ std::filesystem::path TablePath(const std::filesystem::path& table_dir,
 class MaterializedIterator final : public Iterator {
  public:
   explicit MaterializedIterator(
-      std::vector<std::pair<std::string, std::string>> rows)
-      : rows_(std::move(rows)) {}
+      std::vector<std::pair<std::string, std::string>> rows,
+      Status status = Status::OK())
+      : rows_(std::move(rows)), status_(std::move(status)) {}
 
   bool Valid() const override { return index_ < rows_.size(); }
 
@@ -85,11 +86,12 @@ class MaterializedIterator final : public Iterator {
     return rows_[index_].second;
   }
 
-  Status status() const override { return Status::OK(); }
+  Status status() const override { return status_; }
 
  private:
   std::vector<std::pair<std::string, std::string>> rows_;
   std::size_t index_ = 0;
+  Status status_;
 };
 
 }  // namespace
@@ -249,6 +251,9 @@ class DBImpl final : public DB {
       }
 
       const TableLookup table_lookup = it->reader->Lookup(key);
+      if (!table_lookup.status.ok()) {
+        return {"", table_lookup.status};
+      }
       if (!table_lookup.found) {
         continue;
       }
@@ -269,7 +274,12 @@ class DBImpl final : public DB {
 
     std::map<std::string, std::string> visible;
     for (const auto& table : tables_) {
-      for (const TableEntry& entry : table.reader->entries()) {
+      auto [entries, read_status] = table.reader->ReadAll();
+      if (!read_status.ok()) {
+        return std::make_unique<MaterializedIterator>(
+            std::vector<std::pair<std::string, std::string>>{}, read_status);
+      }
+      for (const TableEntry& entry : entries) {
         if (entry.type == RecordType::kDelete) {
           visible.erase(entry.key);
         } else {
@@ -323,7 +333,8 @@ class DBImpl final : public DB {
 
     for (const auto& [file_number, manifest_metadata] : active_tables) {
       const std::filesystem::path path = TablePath(table_dir_, file_number);
-      auto [table_reader, status] = SSTableReader::Open(path);
+      auto [table_reader, status] =
+          SSTableReader::Open(path, options_.block_cache_size);
       if (!status.ok()) {
         return status;
       }
@@ -405,7 +416,8 @@ class DBImpl final : public DB {
       return manifest_status;
     }
 
-    auto [reader, open_status] = SSTableReader::Open(final_path);
+    auto [reader, open_status] =
+        SSTableReader::Open(final_path, options_.block_cache_size);
     if (!open_status.ok()) {
       return open_status;
     }
@@ -482,7 +494,8 @@ class DBImpl final : public DB {
                                final_path.string() + ": " + ec.message());
       }
 
-      auto [reader, open_status] = SSTableReader::Open(final_path);
+      auto [reader, open_status] =
+          SSTableReader::Open(final_path, options_.block_cache_size);
       if (!open_status.ok()) {
         return open_status;
       }

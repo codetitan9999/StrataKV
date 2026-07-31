@@ -298,6 +298,34 @@ void ReadsLegacySingleBlockTable(TestRunner* runner) {
                  "legacy table metadata");
 }
 
+void LazilyReadsAndCachesDataBlocks(TestRunner* runner) {
+  TempDir dir;
+  const auto table_path = dir.path() / "000001.sst";
+  stratakv::SSTableBuilder builder(table_path, 24);
+  for (int i = 0; i < 8; ++i) {
+    runner->ExpectOk(builder.Add("key-" + std::to_string(i),
+                                 "value-" + std::to_string(i)),
+                     "add cache test entry");
+  }
+  stratakv::TableMetadata metadata;
+  runner->ExpectOk(builder.Finish(&metadata), "finish cache test table");
+
+  auto [reader, status] = stratakv::SSTableReader::Open(table_path, 64);
+  runner->ExpectOk(status, "open lazy table");
+  if (!reader) return;
+  std::error_code ec;
+  std::filesystem::remove(table_path, ec);
+  runner->Expect(!ec, "remove table after opening index");
+
+  auto [first_value, first_status] = reader->Get("key-0");
+  runner->ExpectOk(first_status, "cached first block remains readable");
+  runner->Expect(first_value == "value-0", "cached first block value");
+  auto [later_value, later_status] = reader->Get("key-7");
+  (void)later_value;
+  runner->Expect(later_status.code() == stratakv::Status::Code::kIOError,
+                 "uncached block is read lazily from the table file");
+}
+
 }  // namespace
 
 int main() {
@@ -309,5 +337,6 @@ int main() {
   ReadsAcrossMultipleBlocks(&runner);
   DetectsCorruptIndexBlock(&runner);
   ReadsLegacySingleBlockTable(&runner);
+  LazilyReadsAndCachesDataBlocks(&runner);
   return runner.Finish();
 }
