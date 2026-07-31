@@ -13,6 +13,7 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - Delete tombstones
 - WAL replay on reopen, including torn-tail recovery
 - Multi-block SSTables with per-block checksums and an on-disk index
+- Lazy SSTable block reads with a bounded per-table LRU cache
 - Memtable flush to SSTables with WAL rotation
 - Reads from both memtable and flushed SSTables
 - Manifest file with checksummed table metadata records
@@ -74,7 +75,7 @@ docs/               architecture notes
 
 ### Phase 1: Storage Engine
 
-- Multi-block SSTables with index blocks
+- Configurable shared block-cache accounting across tables
 - Streaming range scans through merged iterators
 - More recovery and corruption tests
 - Benchmarks for writes, reads, scans, recovery, and compaction
