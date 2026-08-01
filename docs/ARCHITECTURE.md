@@ -55,13 +55,17 @@ footer: total entry count, index location, index checksum, format magic
 
 The reader loads and verifies only the footer, index, and first data block at
 open. Point lookups binary-search the index and read the selected data block on
-demand. Decoded blocks are retained in a bounded per-table LRU cache controlled
-by `Options::block_cache_size`; checksum, ordering, and index-boundary failures
+demand. Decoded blocks are retained in a database-wide LRU cache keyed by
+table path and block byte range. `Options::block_cache_size` is a single memory
+budget shared by every open table, preventing memory use from scaling with the
+SSTable count. `DB::GetBlockCacheStats` reports hits, misses, evictions, usage,
+and capacity for diagnostics and benchmarks; checksum, ordering, and
+index-boundary failures
 found during lazy reads are returned to the caller. Full scans validate blocks
 as they traverse them. Readers retain
 compatibility with the original single-block `STKV0001` format, while new
-tables use the indexed `STKV0002` format. A database-wide shared cache and
-prefix compression remain future work.
+tables use the indexed `STKV0002` format. Prefix compression remains future
+work.
 
 ### Compaction
 
@@ -128,6 +132,7 @@ Current tests cover:
 - SSTable round trips, sorted iteration, key ordering validation, and checksum corruption detection
 - Multi-block SSTable boundaries, index corruption, and legacy format compatibility
 - Lazy block I/O, cache hits after file removal, and deferred I/O failures
+- Shared-cache reuse across readers and cache hit/miss accounting
 - Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
 - Manifest replay, invalid metadata rejection, checksum corruption detection, and missing table handling
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
@@ -144,13 +149,13 @@ The project starts with a tiny local harness to avoid dependency friction. Once 
 ## Benchmark Strategy
 
 The current benchmark measures local `Put` performance, then reopens the database
-and measures random `Get` performance against flushed SSTables plus the final WAL
-tail. It reports write throughput, read throughput, and get latency percentiles.
+and runs cold and warm random `Get` passes against flushed SSTables plus the final
+WAL tail. It reports throughput, latency percentiles, and shared block-cache
+hits, misses, evictions, and usage.
 
 Future benchmark tracks:
 
 - sequential write throughput with sync off and sync on
-- separate warm-cache and cold-cache point-read latency
 - range-scan throughput
 - recovery time by WAL size
 - compaction throughput and write amplification
@@ -168,7 +173,6 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 2: SSTable Format
 
-- Add shared cache accounting and cache hit/miss metrics
 - Add prefix compression and golden encoding tests
 
 ### Milestone 3: Flush and Recovery
