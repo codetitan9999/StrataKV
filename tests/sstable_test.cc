@@ -310,9 +310,18 @@ void LazilyReadsAndCachesDataBlocks(TestRunner* runner) {
   stratakv::TableMetadata metadata;
   runner->ExpectOk(builder.Finish(&metadata), "finish cache test table");
 
-  auto [reader, status] = stratakv::SSTableReader::Open(table_path, 64);
+  auto cache = std::make_shared<stratakv::BlockCache>(64);
+  auto [reader, status] = stratakv::SSTableReader::Open(table_path, cache);
   runner->ExpectOk(status, "open lazy table");
   if (!reader) return;
+  const auto after_first_open = cache->stats();
+  runner->Expect(after_first_open.misses == 1,
+                 "first reader records a shared-cache miss");
+  auto [second_reader, second_status] =
+      stratakv::SSTableReader::Open(table_path, cache);
+  runner->ExpectOk(second_status, "open second reader with shared cache");
+  runner->Expect(cache->stats().hits == 1,
+                 "second reader reuses the cached block");
   std::error_code ec;
   std::filesystem::remove(table_path, ec);
   runner->Expect(!ec, "remove table after opening index");
@@ -320,10 +329,28 @@ void LazilyReadsAndCachesDataBlocks(TestRunner* runner) {
   auto [first_value, first_status] = reader->Get("key-0");
   runner->ExpectOk(first_status, "cached first block remains readable");
   runner->Expect(first_value == "value-0", "cached first block value");
+  auto [second_value, second_get_status] = second_reader->Get("key-0");
+  runner->ExpectOk(second_get_status, "shared cached block remains readable");
+  runner->Expect(second_value == "value-0", "shared cached block value");
   auto [later_value, later_status] = reader->Get("key-7");
   (void)later_value;
   runner->Expect(later_status.code() == stratakv::Status::Code::kIOError,
                  "uncached block is read lazily from the table file");
+}
+
+void EnforcesSharedCacheBudget(TestRunner* runner) {
+  stratakv::BlockCache cache(64);
+  auto first = std::make_shared<const std::vector<stratakv::TableEntry>>();
+  auto second = std::make_shared<const std::vector<stratakv::TableEntry>>();
+  cache.Insert("000001.sst", 0, 40, first);
+  cache.Insert("000002.sst", 0, 40, second);
+  const auto stats = cache.stats();
+  runner->Expect(stats.evictions == 1, "shared cache evicts across tables");
+  runner->Expect(stats.usage_bytes == 40, "shared cache respects byte budget");
+  runner->Expect(stats.capacity_bytes == 64,
+                 "shared cache reports configured capacity");
+  runner->Expect(cache.Lookup("000001.sst", 0, 40) == nullptr,
+                 "least-recently-used block was evicted");
 }
 
 }  // namespace
@@ -338,5 +365,6 @@ int main() {
   DetectsCorruptIndexBlock(&runner);
   ReadsLegacySingleBlockTable(&runner);
   LazilyReadsAndCachesDataBlocks(&runner);
+  EnforcesSharedCacheBudget(&runner);
   return runner.Finish();
 }

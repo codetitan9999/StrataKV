@@ -99,7 +99,9 @@ class MaterializedIterator final : public Iterator {
 class DBImpl final : public DB {
  public:
   DBImpl(Options options, std::filesystem::path path)
-      : options_(options), db_path_(std::move(path)) {}
+      : options_(options),
+        db_path_(std::move(path)),
+        block_cache_(std::make_shared<BlockCache>(options.block_cache_size)) {}
 
   Status OpenInternal() {
     std::error_code ec;
@@ -305,6 +307,10 @@ class DBImpl final : public DB {
     return std::make_unique<MaterializedIterator>(std::move(rows));
   }
 
+  BlockCacheStats GetBlockCacheStats() const override {
+    return block_cache_->stats();
+  }
+
  private:
   struct TableState {
     std::uint64_t file_number = 0;
@@ -334,7 +340,7 @@ class DBImpl final : public DB {
     for (const auto& [file_number, manifest_metadata] : active_tables) {
       const std::filesystem::path path = TablePath(table_dir_, file_number);
       auto [table_reader, status] =
-          SSTableReader::Open(path, options_.block_cache_size);
+          SSTableReader::Open(path, block_cache_);
       if (!status.ok()) {
         return status;
       }
@@ -417,7 +423,7 @@ class DBImpl final : public DB {
     }
 
     auto [reader, open_status] =
-        SSTableReader::Open(final_path, options_.block_cache_size);
+        SSTableReader::Open(final_path, block_cache_);
     if (!open_status.ok()) {
       return open_status;
     }
@@ -495,7 +501,7 @@ class DBImpl final : public DB {
       }
 
       auto [reader, open_status] =
-          SSTableReader::Open(final_path, options_.block_cache_size);
+          SSTableReader::Open(final_path, block_cache_);
       if (!open_status.ok()) {
         return open_status;
       }
@@ -562,6 +568,7 @@ class DBImpl final : public DB {
   std::uint64_t next_file_number_ = 1;
   std::unique_ptr<ManifestWriter> manifest_;
   std::unique_ptr<WalWriter> wal_;
+  std::shared_ptr<BlockCache> block_cache_;
 };
 
 std::pair<std::unique_ptr<DB>, Status> DB::Open(const Options& options,

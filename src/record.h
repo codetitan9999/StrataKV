@@ -17,4 +17,10 @@ struct LogRecord {
   std::string value;
 };
 
+struct TableEntry {
+  RecordType type = RecordType::kPut;
+  std::string key;
+  std::string value;
+};
+
 }  // namespace stratakv

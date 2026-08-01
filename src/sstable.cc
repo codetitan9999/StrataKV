@@ -378,7 +378,7 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
 }
 
 std::pair<std::unique_ptr<SSTableReader>, Status> SSTableReader::Open(
-    std::filesystem::path path, std::size_t block_cache_capacity) {
+    std::filesystem::path path, std::shared_ptr<BlockCache> block_cache) {
   std::ifstream stream(path, std::ios::binary | std::ios::ate);
   if (!stream) {
     return {nullptr, Status::IOError("failed to open SSTable for reading: " +
@@ -426,7 +426,7 @@ std::pair<std::unique_ptr<SSTableReader>, Status> SSTableReader::Open(
                            count, file_size};
     return {std::unique_ptr<SSTableReader>(new SSTableReader(
                 path, {}, std::move(entries), std::move(metadata),
-                block_cache_capacity)),
+                std::move(block_cache))),
             Status::OK()};
   }
   if (std::string_view(magic.data(), magic.size()) != kMagic ||
@@ -480,7 +480,7 @@ std::pair<std::unique_ptr<SSTableReader>, Status> SSTableReader::Open(
   TableMetadata metadata{0, path, {}, index.back().last_key, entry_count,
                          file_size};
   auto reader = std::unique_ptr<SSTableReader>(new SSTableReader(
-      path, std::move(index), {}, std::move(metadata), block_cache_capacity));
+      path, std::move(index), {}, std::move(metadata), std::move(block_cache)));
   auto [first, first_status] = reader->ReadBlock(0);
   if (!first_status.ok()) {
     return {nullptr, first_status};
@@ -584,27 +584,24 @@ const TableMetadata& SSTableReader::metadata() const { return metadata_; }
 SSTableReader::SSTableReader(
     std::filesystem::path path, std::vector<BlockIndexEntry> index,
     std::vector<TableEntry> legacy_entries, TableMetadata metadata,
-    std::size_t block_cache_capacity)
+    std::shared_ptr<BlockCache> block_cache)
     : path_(std::move(path)),
       index_(std::move(index)),
       legacy_entries_(std::move(legacy_entries)),
       metadata_(std::move(metadata)),
-      block_cache_capacity_(block_cache_capacity) {}
+      block_cache_(std::move(block_cache)) {}
 
 std::pair<std::shared_ptr<const std::vector<TableEntry>>, Status>
 SSTableReader::ReadBlock(std::size_t block_index) const {
-  {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    const auto cached = block_cache_.find(block_index);
-    if (cached != block_cache_.end()) {
-      lru_.splice(lru_.begin(), lru_, cached->second.lru_position);
-      return {cached->second.entries, Status::OK()};
-    }
-  }
   if (block_index >= index_.size()) {
     return {nullptr, Status::InvalidArgument("SSTable block index out of range")};
   }
   const BlockIndexEntry& descriptor = index_[block_index];
+  if (block_cache_) {
+    auto cached = block_cache_->Lookup(path_, descriptor.offset,
+                                       descriptor.size);
+    if (cached) return {std::move(cached), Status::OK()};
+  }
   std::ifstream stream(path_, std::ios::binary);
   if (!stream) {
     return {nullptr, Status::IOError("failed to open SSTable block")};
@@ -625,24 +622,10 @@ SSTableReader::ReadBlock(std::size_t block_index) const {
        decoded->front().key <= index_[block_index - 1].last_key)) {
     return {nullptr, Status::Corruption("SSTable index does not match data block")};
   }
-  if (block_cache_capacity_ > 0 && descriptor.size <= block_cache_capacity_) {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    const auto existing = block_cache_.find(block_index);
-    if (existing != block_cache_.end()) {
-      lru_.splice(lru_.begin(), lru_, existing->second.lru_position);
-      return {existing->second.entries, Status::OK()};
-    }
-    while (!lru_.empty() &&
-           block_cache_usage_ + descriptor.size > block_cache_capacity_) {
-      const std::size_t victim = lru_.back();
-      block_cache_usage_ -= block_cache_.at(victim).charge;
-      block_cache_.erase(victim);
-      lru_.pop_back();
-    }
-    lru_.push_front(block_index);
-    block_cache_[block_index] = CachedBlock{decoded,
-        static_cast<std::size_t>(descriptor.size), lru_.begin()};
-    block_cache_usage_ += static_cast<std::size_t>(descriptor.size);
+  if (block_cache_) {
+    auto cached = block_cache_->Insert(path_, descriptor.offset,
+                                       descriptor.size, decoded);
+    return {std::move(cached), Status::OK()};
   }
   return {std::move(decoded), Status::OK()};
 }

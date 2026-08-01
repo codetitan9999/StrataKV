@@ -15,7 +15,7 @@ struct Options {
   // Kept in the public options now so table cache design has a stable home.
   std::size_t max_open_files = 512;
 
-  // Maximum decoded SSTable data-block bytes retained per open table.
+  // Maximum decoded SSTable data-block bytes retained across the database.
   // A value of 0 disables block caching while preserving lazy reads.
   std::size_t block_cache_size = 8 * 1024 * 1024;
 

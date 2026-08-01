@@ -11,6 +11,7 @@ option(STRATAKV_BUILD_TESTS "Build StrataKV unit tests" ON)
 option(STRATAKV_BUILD_BENCHMARKS "Build StrataKV benchmark harnesses" ON)
 
 add_library(stratakv
+  src/block_cache.cc
   src/compaction.cc
   src/db.cc
   src/manifest.cc
