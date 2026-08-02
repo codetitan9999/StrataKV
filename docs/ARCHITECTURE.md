@@ -39,6 +39,14 @@ Reads follow this order:
 
 Deletes are tombstones, not immediate removals from history. Compaction decides when a tombstone is safe to drop.
 
+Database iterators take a stable snapshot of the current source set and perform
+an incremental k-way merge. The mutable memtable is copied at iterator creation,
+while immutable table readers are retained by shared ownership. The iterator
+keeps only its current entry per source and the active decoded SSTable blocks in
+memory; it does not materialize all table contents. Newer sources win when keys
+overlap, tombstones hide older values, and block I/O or checksum failures are
+reported through `Iterator::status()` when traversal reaches the affected block.
+
 ### SSTables
 
 `src/sstable.*` implements the immutable sorted table format. Writers split
@@ -133,6 +141,8 @@ Current tests cover:
 - Multi-block SSTable boundaries, index corruption, and legacy format compatibility
 - Lazy block I/O, cache hits after file removal, and deferred I/O failures
 - Shared-cache reuse across readers and cache hit/miss accounting
+- Streaming iterator seek, version selection, tombstone hiding, and deferred
+  block-error propagation across memtable and SSTables
 - Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
 - Manifest replay, invalid metadata rejection, checksum corruption detection, and missing table handling
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
@@ -140,7 +150,6 @@ Current tests cover:
 Next test layers should add:
 
 - WAL replay limits for very large records and injected I/O failures
-- Streaming iterator merge correctness across memtable and SSTables
 - Multi-level compaction correctness with overwritten keys and tombstones
 - Fault injection around file creation, rename, and manifest updates
 
@@ -149,14 +158,14 @@ The project starts with a tiny local harness to avoid dependency friction. Once 
 ## Benchmark Strategy
 
 The current benchmark measures local `Put` performance, then reopens the database
-and runs cold and warm random `Get` passes against flushed SSTables plus the final
-WAL tail. It reports throughput, latency percentiles, and shared block-cache
-hits, misses, evictions, and usage.
+and runs cold and warm random `Get` passes plus a full streaming scan against
+flushed SSTables and the final WAL tail. It reports throughput, latency
+percentiles, and shared block-cache hits, misses, evictions, and usage.
 
 Future benchmark tracks:
 
 - sequential write throughput with sync off and sync on
-- range-scan throughput
+- bounded and selective range-scan throughput
 - recovery time by WAL size
 - compaction throughput and write amplification
 - network request latency after Phase 2
@@ -182,8 +191,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 4: Iterators and Compaction
 
-- Merge iterators across memory and SSTables
-- Implement range scans
+- Add bounded range and prefix scan options
 - Add overlap-aware leveled compaction
 - Track read/write amplification in benchmarks
 
