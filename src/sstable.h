@@ -11,6 +11,7 @@
 
 #include "record.h"
 #include "block_cache.h"
+#include "internal_iterator.h"
 #include "stratakv/iterator.h"
 #include "stratakv/status.h"
 
@@ -60,19 +61,21 @@ class SSTableBuilder {
   bool finished_ = false;
 };
 
-class SSTableReader {
+class SSTableReader : public std::enable_shared_from_this<SSTableReader> {
  public:
-  static std::pair<std::unique_ptr<SSTableReader>, Status> Open(
+  static std::pair<std::shared_ptr<SSTableReader>, Status> Open(
       std::filesystem::path path,
       std::shared_ptr<BlockCache> block_cache = nullptr);
 
   [[nodiscard]] TableLookup Lookup(std::string_view key) const;
   [[nodiscard]] std::pair<std::string, Status> Get(std::string_view key) const;
   [[nodiscard]] std::unique_ptr<Iterator> NewIterator() const;
+  [[nodiscard]] std::unique_ptr<InternalIterator> NewEntryIterator() const;
   [[nodiscard]] std::pair<std::vector<TableEntry>, Status> ReadAll() const;
   [[nodiscard]] const TableMetadata& metadata() const;
 
  private:
+  friend class SSTableEntryIterator;
   SSTableReader(std::filesystem::path path,
                 std::vector<TableBlockIndexEntry> index,
                 std::vector<TableEntry> legacy_entries,

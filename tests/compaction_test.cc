@@ -57,7 +57,7 @@ class TestRunner {
   int failures_ = 0;
 };
 
-std::unique_ptr<stratakv::SSTableReader> BuildTableOrNull(
+std::shared_ptr<stratakv::SSTableReader> BuildTableOrNull(
     TestRunner* runner, const std::filesystem::path& path,
     const std::vector<stratakv::TableEntry>& entries) {
   stratakv::SSTableBuilder builder(path);

@@ -16,6 +16,7 @@
 
 #include "compaction.h"
 #include "manifest.h"
+#include "merge_iterator.h"
 #include "memtable.h"
 #include "record.h"
 #include "sstable.h"
@@ -47,52 +48,6 @@ std::filesystem::path TablePath(const std::filesystem::path& table_dir,
   name << std::setw(6) << std::setfill('0') << file_number << ".sst";
   return table_dir / name.str();
 }
-
-class MaterializedIterator final : public Iterator {
- public:
-  explicit MaterializedIterator(
-      std::vector<std::pair<std::string, std::string>> rows,
-      Status status = Status::OK())
-      : rows_(std::move(rows)), status_(std::move(status)) {}
-
-  bool Valid() const override { return index_ < rows_.size(); }
-
-  void SeekToFirst() override { index_ = 0; }
-
-  void Seek(std::string_view target) override {
-    const auto it = std::lower_bound(
-        rows_.begin(), rows_.end(), target,
-        [](const auto& row, std::string_view key) { return row.first < key; });
-    index_ = static_cast<std::size_t>(it - rows_.begin());
-  }
-
-  void Next() override {
-    if (Valid()) {
-      ++index_;
-    }
-  }
-
-  std::string_view key() const override {
-    if (!Valid()) {
-      return {};
-    }
-    return rows_[index_].first;
-  }
-
-  std::string_view value() const override {
-    if (!Valid()) {
-      return {};
-    }
-    return rows_[index_].second;
-  }
-
-  Status status() const override { return status_; }
-
- private:
-  std::vector<std::pair<std::string, std::string>> rows_;
-  std::size_t index_ = 0;
-  Status status_;
-};
 
 }  // namespace
 
@@ -274,37 +229,14 @@ class DBImpl final : public DB {
 
     std::lock_guard<std::mutex> lock(mu_);
 
-    std::map<std::string, std::string> visible;
+    std::vector<MergeIteratorChild> children;
+    children.reserve(tables_.size() + 1);
+    std::size_t priority = 0;
     for (const auto& table : tables_) {
-      auto [entries, read_status] = table.reader->ReadAll();
-      if (!read_status.ok()) {
-        return std::make_unique<MaterializedIterator>(
-            std::vector<std::pair<std::string, std::string>>{}, read_status);
-      }
-      for (const TableEntry& entry : entries) {
-        if (entry.type == RecordType::kDelete) {
-          visible.erase(entry.key);
-        } else {
-          visible[entry.key] = entry.value;
-        }
-      }
+      children.push_back({table.reader->NewEntryIterator(), priority++});
     }
-
-    for (const MemTableEntry& entry : memtable_.Snapshot()) {
-      if (entry.type == RecordType::kDelete) {
-        visible.erase(entry.key);
-      } else {
-        visible[entry.key] = entry.value;
-      }
-    }
-
-    std::vector<std::pair<std::string, std::string>> rows;
-    rows.reserve(visible.size());
-    for (const auto& [visible_key, visible_value] : visible) {
-      rows.emplace_back(visible_key, visible_value);
-    }
-
-    return std::make_unique<MaterializedIterator>(std::move(rows));
+    children.push_back({memtable_.NewEntryIterator(), priority});
+    return NewMergingIterator(std::move(children));
   }
 
   BlockCacheStats GetBlockCacheStats() const override {
@@ -314,7 +246,7 @@ class DBImpl final : public DB {
  private:
   struct TableState {
     std::uint64_t file_number = 0;
-    std::unique_ptr<SSTableReader> reader;
+    std::shared_ptr<SSTableReader> reader;
   };
 
   Status LoadTables() {

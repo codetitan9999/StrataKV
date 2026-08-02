@@ -8,6 +8,35 @@
 namespace stratakv {
 namespace {
 
+class MemTableEntryIterator final : public InternalIterator {
+ public:
+  explicit MemTableEntryIterator(std::vector<MemTableEntry> entries)
+      : entries_(std::move(entries)) {}
+  bool Valid() const override { return index_ < entries_.size(); }
+  void SeekToFirst() override { index_ = 0; }
+  void Seek(std::string_view target) override {
+    const auto it = std::lower_bound(
+        entries_.begin(), entries_.end(), target,
+        [](const MemTableEntry& entry, std::string_view key) {
+          return entry.key < key;
+        });
+    index_ = static_cast<std::size_t>(it - entries_.begin());
+  }
+  void Next() override { if (Valid()) ++index_; }
+  RecordType type() const override { return entries_[index_].type; }
+  std::string_view key() const override {
+    return Valid() ? entries_[index_].key : std::string_view{};
+  }
+  std::string_view value() const override {
+    return Valid() ? entries_[index_].value : std::string_view{};
+  }
+  Status status() const override { return Status::OK(); }
+
+ private:
+  std::vector<MemTableEntry> entries_;
+  std::size_t index_ = 0;
+};
+
 class MemTableIterator final : public Iterator {
  public:
   explicit MemTableIterator(std::vector<std::pair<std::string, std::string>> rows)
@@ -149,6 +178,10 @@ std::unique_ptr<Iterator> MemTable::NewIterator() const {
   }
 
   return std::make_unique<MemTableIterator>(std::move(rows));
+}
+
+std::unique_ptr<InternalIterator> MemTable::NewEntryIterator() const {
+  return std::make_unique<MemTableEntryIterator>(Snapshot());
 }
 
 std::size_t MemTable::ApproximateMemoryUsage() const {

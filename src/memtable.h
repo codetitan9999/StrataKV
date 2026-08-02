@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "record.h"
+#include "internal_iterator.h"
 #include "stratakv/iterator.h"
 #include "stratakv/status.h"
 
@@ -39,6 +40,7 @@ class MemTable {
   [[nodiscard]] std::pair<std::string, Status> Get(std::string_view key) const;
   [[nodiscard]] std::vector<MemTableEntry> Snapshot() const;
   [[nodiscard]] std::unique_ptr<Iterator> NewIterator() const;
+  [[nodiscard]] std::unique_ptr<InternalIterator> NewEntryIterator() const;
   [[nodiscard]] std::size_t ApproximateMemoryUsage() const;
   [[nodiscard]] bool empty() const;
   void Clear();

@@ -238,6 +238,95 @@ class SSTableIterator final : public Iterator {
 
 }  // namespace
 
+class SSTableEntryIterator final : public InternalIterator {
+ public:
+  explicit SSTableEntryIterator(std::shared_ptr<const SSTableReader> reader)
+      : reader_(std::move(reader)) {}
+
+  bool Valid() const override {
+    return status_.ok() && entries_ != nullptr && entry_index_ < entries_->size();
+  }
+
+  void SeekToFirst() override {
+    status_ = Status::OK();
+    block_index_ = 0;
+    entry_index_ = 0;
+    LoadBlock();
+  }
+
+  void Seek(std::string_view target) override {
+    status_ = Status::OK();
+    if (!reader_->legacy_entries_.empty()) {
+      block_index_ = 0;
+    } else {
+      const auto it = std::lower_bound(
+          reader_->index_.begin(), reader_->index_.end(), target,
+          [](const BlockIndexEntry& entry, std::string_view key) {
+            return entry.last_key < key;
+          });
+      block_index_ = static_cast<std::size_t>(it - reader_->index_.begin());
+    }
+    entry_index_ = 0;
+    LoadBlock();
+    if (!Valid()) return;
+    const auto it = std::lower_bound(
+        entries_->begin(), entries_->end(), target,
+        [](const TableEntry& entry, std::string_view key) {
+          return entry.key < key;
+        });
+    entry_index_ = static_cast<std::size_t>(it - entries_->begin());
+    AdvancePastBlockEnd();
+  }
+
+  void Next() override {
+    if (!Valid()) return;
+    ++entry_index_;
+    AdvancePastBlockEnd();
+  }
+
+  RecordType type() const override { return (*entries_)[entry_index_].type; }
+  std::string_view key() const override {
+    return Valid() ? (*entries_)[entry_index_].key : std::string_view{};
+  }
+  std::string_view value() const override {
+    return Valid() ? (*entries_)[entry_index_].value : std::string_view{};
+  }
+  Status status() const override { return status_; }
+
+ private:
+  std::size_t BlockCount() const {
+    return reader_->legacy_entries_.empty() ? reader_->index_.size() : 1;
+  }
+
+  void LoadBlock() {
+    entries_.reset();
+    if (block_index_ >= BlockCount()) return;
+    if (!reader_->legacy_entries_.empty()) {
+      entries_ = std::shared_ptr<const std::vector<TableEntry>>(
+          reader_, &reader_->legacy_entries_);
+      return;
+    }
+    auto [entries, read_status] = reader_->ReadBlock(block_index_);
+    status_ = read_status;
+    entries_ = std::move(entries);
+  }
+
+  void AdvancePastBlockEnd() {
+    while (status_.ok() && entries_ != nullptr &&
+           entry_index_ >= entries_->size()) {
+      ++block_index_;
+      entry_index_ = 0;
+      LoadBlock();
+    }
+  }
+
+  std::shared_ptr<const SSTableReader> reader_;
+  std::shared_ptr<const std::vector<TableEntry>> entries_;
+  std::size_t block_index_ = 0;
+  std::size_t entry_index_ = 0;
+  Status status_ = Status::OK();
+};
+
 SSTableBuilder::SSTableBuilder(std::filesystem::path path,
                                std::size_t target_block_size)
     : path_(std::move(path)),
@@ -377,7 +466,7 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
   return Status::OK();
 }
 
-std::pair<std::unique_ptr<SSTableReader>, Status> SSTableReader::Open(
+std::pair<std::shared_ptr<SSTableReader>, Status> SSTableReader::Open(
     std::filesystem::path path, std::shared_ptr<BlockCache> block_cache) {
   std::ifstream stream(path, std::ios::binary | std::ios::ate);
   if (!stream) {
@@ -424,7 +513,7 @@ std::pair<std::unique_ptr<SSTableReader>, Status> SSTableReader::Open(
     }
     TableMetadata metadata{0, path, entries.front().key, entries.back().key,
                            count, file_size};
-    return {std::unique_ptr<SSTableReader>(new SSTableReader(
+    return {std::shared_ptr<SSTableReader>(new SSTableReader(
                 path, {}, std::move(entries), std::move(metadata),
                 std::move(block_cache))),
             Status::OK()};
@@ -479,7 +568,7 @@ std::pair<std::unique_ptr<SSTableReader>, Status> SSTableReader::Open(
   }
   TableMetadata metadata{0, path, {}, index.back().last_key, entry_count,
                          file_size};
-  auto reader = std::unique_ptr<SSTableReader>(new SSTableReader(
+  auto reader = std::shared_ptr<SSTableReader>(new SSTableReader(
       path, std::move(index), {}, std::move(metadata), std::move(block_cache)));
   auto [first, first_status] = reader->ReadBlock(0);
   if (!first_status.ok()) {
@@ -561,6 +650,10 @@ std::unique_ptr<Iterator> SSTableReader::NewIterator() const {
     }
   }
   return std::make_unique<SSTableIterator>(std::move(rows));
+}
+
+std::unique_ptr<InternalIterator> SSTableReader::NewEntryIterator() const {
+  return std::make_unique<SSTableEntryIterator>(shared_from_this());
 }
 
 std::pair<std::vector<TableEntry>, Status> SSTableReader::ReadAll() const {

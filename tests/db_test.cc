@@ -3,6 +3,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -294,6 +295,68 @@ void IteratorMergesFlushedTables(TestRunner* runner) {
                  "iterator should merge flushed tables and tombstones");
 }
 
+void IteratorSeeksAcrossVersions(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.level0_compaction_trigger = 0;
+  auto db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "a", "old-a"),
+                   "put old a");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "b", "old-b"),
+                   "put old b");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "a", "new-a"),
+                   "overwrite a");
+  runner->ExpectOk(db->Delete(stratakv::WriteOptions{}, "b"), "delete b");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "d", "four"), "put d");
+
+  auto it = db->NewIterator(stratakv::ReadOptions{});
+  it->Seek("b");
+  runner->Expect(it->Valid(), "seek should find a later live key");
+  runner->Expect(it->key() == "d", "seek should skip a tombstoned key");
+  it->SeekToFirst();
+  runner->Expect(it->Valid() && it->key() == "a" && it->value() == "new-a",
+                 "newest table value should win during merge");
+  it->Next();
+  runner->Expect(it->Valid() && it->key() == "d",
+                 "merge should return each visible key once");
+  it->Next();
+  runner->Expect(!it->Valid(), "merged iterator should reach its end");
+  runner->ExpectOk(it->status(), "seek merge iterator status");
+}
+
+void IteratorReportsDeferredBlockErrors(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 6000;
+  options.level0_compaction_trigger = 0;
+  auto db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+
+  const std::string value(200, 'x');
+  for (int i = 0; i < 30; ++i) {
+    std::ostringstream key;
+    key << "key-" << std::setw(3) << std::setfill('0') << i;
+    runner->ExpectOk(db->Put(stratakv::WriteOptions{}, key.str(), value),
+                     "put scan error entry");
+  }
+  runner->Expect(CountSSTables(dir.path()) == 1,
+                 "scan error setup should flush one multi-block table");
+
+  auto it = db->NewIterator(stratakv::ReadOptions{});
+  std::error_code ec;
+  std::filesystem::remove(dir.path() / "sst" / "000001.sst", ec);
+  runner->Expect(!ec, "remove table before deferred scan read");
+  int visited = 0;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) ++visited;
+  runner->Expect(visited > 0 && visited < 30,
+                 "scan should consume cached data before the missing block");
+  runner->Expect(it->status().code() == stratakv::Status::Code::kIOError,
+                 "scan should expose deferred block I/O failure");
+}
+
 void MissingManifestTableFailsOpen(TestRunner* runner) {
   TempDir dir;
   stratakv::Options options;
@@ -413,6 +476,8 @@ int main() {
   FlushesMemTableToSSTable(&runner);
   FlushedTombstoneHidesOlderTableValue(&runner);
   IteratorMergesFlushedTables(&runner);
+  IteratorSeeksAcrossVersions(&runner);
+  IteratorReportsDeferredBlockErrors(&runner);
   MissingManifestTableFailsOpen(&runner);
   CompactsFlushedTables(&runner);
   CompactionDropsCoveredTombstones(&runner);

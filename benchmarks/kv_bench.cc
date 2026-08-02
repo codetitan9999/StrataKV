@@ -105,6 +105,16 @@ int main(int argc, char** argv) {
   if (cold_duration == Clock::duration::zero() ||
       warm_duration == Clock::duration::zero()) return 1;
 
+  std::size_t scanned = 0;
+  const auto scan_start = Clock::now();
+  auto iterator = db->NewIterator(stratakv::ReadOptions{});
+  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) ++scanned;
+  const auto scan_duration = Clock::now() - scan_start;
+  if (!iterator->status().ok() || scanned != operations) {
+    std::cerr << "scan failed: " << iterator->status() << '\n';
+    return 1;
+  }
+
   const auto percentile = [](std::vector<double> latencies, double p) {
     std::sort(latencies.begin(), latencies.end());
     const std::size_t idx =
@@ -133,6 +143,8 @@ int main(int argc, char** argv) {
             << percentile(warm_latencies_us, 0.50) << "/"
             << percentile(warm_latencies_us, 0.95) << "/"
             << percentile(warm_latencies_us, 0.99) << " us\n";
+  std::cout << "full scan throughput: "
+            << scanned / Seconds(scan_duration) << " entries/sec\n";
   std::cout << "cache hits/misses/evictions: " << warm_stats.hits << "/"
             << warm_stats.misses << "/" << warm_stats.evictions << '\n';
   std::cout << "cache usage after cold pass: " << cold_stats.usage_bytes
