@@ -327,6 +327,50 @@ void IteratorSeeksAcrossVersions(TestRunner* runner) {
   runner->ExpectOk(it->status(), "seek merge iterator status");
 }
 
+void IteratorHonorsBoundsAndPrefix(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.level0_compaction_trigger = 0;
+  auto db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+
+  for (const std::string& key : {"aa", "app-1", "app-2", "app-3",
+                                 "banana", "carrot"}) {
+    runner->ExpectOk(db->Put(stratakv::WriteOptions{}, key, key),
+                     "put bounded scan key");
+  }
+  runner->ExpectOk(db->Delete(stratakv::WriteOptions{}, "app-2"),
+                   "delete bounded scan key");
+
+  stratakv::ReadOptions range;
+  range.lower_bound = "app-1";
+  range.upper_bound = "banana";
+  std::vector<std::string> keys;
+  auto it = db->NewIterator(range);
+  for (it->SeekToFirst(); it->Valid(); it->Next()) keys.emplace_back(it->key());
+  runner->ExpectOk(it->status(), "bounded iterator status");
+  runner->Expect(keys == std::vector<std::string>({"app-1", "app-3"}),
+                 "range scan should use inclusive/exclusive bounds");
+
+  stratakv::ReadOptions prefix;
+  prefix.prefix = "app-";
+  prefix.lower_bound = "app-2";
+  keys.clear();
+  it = db->NewIterator(prefix);
+  it->Seek("aa");
+  for (; it->Valid(); it->Next()) keys.emplace_back(it->key());
+  runner->ExpectOk(it->status(), "prefix iterator status");
+  runner->Expect(keys == std::vector<std::string>({"app-3"}),
+                 "prefix scan should intersect its lower bound and tombstones");
+
+  prefix.upper_bound = "app-3";
+  it = db->NewIterator(prefix);
+  it->SeekToFirst();
+  runner->Expect(!it->Valid(), "exclusive upper bound should end prefix scan");
+  runner->ExpectOk(it->status(), "empty bounded prefix status");
+}
+
 void IteratorReportsDeferredBlockErrors(TestRunner* runner) {
   TempDir dir;
   stratakv::Options options;
@@ -477,6 +521,7 @@ int main() {
   FlushedTombstoneHidesOlderTableValue(&runner);
   IteratorMergesFlushedTables(&runner);
   IteratorSeeksAcrossVersions(&runner);
+  IteratorHonorsBoundsAndPrefix(&runner);
   IteratorReportsDeferredBlockErrors(&runner);
   MissingManifestTableFailsOpen(&runner);
   CompactsFlushedTables(&runner);

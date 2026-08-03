@@ -225,8 +225,6 @@ class DBImpl final : public DB {
 
   std::unique_ptr<Iterator> NewIterator(
       const ReadOptions& read_options) const override {
-    (void)read_options;
-
     std::lock_guard<std::mutex> lock(mu_);
 
     std::vector<MergeIteratorChild> children;
@@ -236,7 +234,7 @@ class DBImpl final : public DB {
       children.push_back({table.reader->NewEntryIterator(), priority++});
     }
     children.push_back({memtable_.NewEntryIterator(), priority});
-    return NewMergingIterator(std::move(children));
+    return NewMergingIterator(std::move(children), read_options);
   }
 
   BlockCacheStats GetBlockCacheStats() const override {

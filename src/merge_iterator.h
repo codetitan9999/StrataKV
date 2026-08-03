@@ -6,6 +6,7 @@
 
 #include "internal_iterator.h"
 #include "stratakv/iterator.h"
+#include "stratakv/options.h"
 
 namespace stratakv {
 
@@ -15,6 +16,7 @@ struct MergeIteratorChild {
 };
 
 std::unique_ptr<Iterator> NewMergingIterator(
-    std::vector<MergeIteratorChild> children);
+    std::vector<MergeIteratorChild> children,
+    const ReadOptions& read_options = {});
 
 }  // namespace stratakv

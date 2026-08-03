@@ -7,6 +7,7 @@
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -24,9 +25,9 @@ std::filesystem::path FreshBenchDir() {
 }
 
 std::string KeyFor(std::size_t i) {
-  std::string key = "key-";
-  key += std::to_string(i);
-  return key;
+  std::ostringstream key;
+  key << "key-" << std::setw(20) << std::setfill('0') << i;
+  return key.str();
 }
 
 std::string ValueFor(std::size_t i) {
@@ -115,6 +116,26 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  const std::size_t range_begin = operations / 3;
+  const std::size_t range_count =
+      std::min<std::size_t>(1000, operations - range_begin);
+  stratakv::ReadOptions range_options;
+  range_options.lower_bound = KeyFor(range_begin);
+  if (range_begin + range_count < operations) {
+    range_options.upper_bound = KeyFor(range_begin + range_count);
+  }
+  std::size_t range_scanned = 0;
+  const auto range_start = Clock::now();
+  iterator = db->NewIterator(range_options);
+  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+    ++range_scanned;
+  }
+  const auto range_duration = Clock::now() - range_start;
+  if (!iterator->status().ok() || range_scanned != range_count) {
+    std::cerr << "range scan failed: " << iterator->status() << '\n';
+    return 1;
+  }
+
   const auto percentile = [](std::vector<double> latencies, double p) {
     std::sort(latencies.begin(), latencies.end());
     const std::size_t idx =
@@ -145,6 +166,8 @@ int main(int argc, char** argv) {
             << percentile(warm_latencies_us, 0.99) << " us\n";
   std::cout << "full scan throughput: "
             << scanned / Seconds(scan_duration) << " entries/sec\n";
+  std::cout << "bounded scan throughput (" << range_scanned << " entries): "
+            << range_scanned / Seconds(range_duration) << " entries/sec\n";
   std::cout << "cache hits/misses/evictions: " << warm_stats.hits << "/"
             << warm_stats.misses << "/" << warm_stats.evictions << '\n';
   std::cout << "cache usage after cold pass: " << cold_stats.usage_bytes

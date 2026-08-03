@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <string>
 
 namespace stratakv {
 
@@ -30,6 +32,15 @@ struct Options {
 
 struct ReadOptions {
   bool verify_checksums = true;
+
+  // Inclusive lower and exclusive upper bounds for iterators. Point reads
+  // ignore these fields. An empty optional means that side is unbounded.
+  std::optional<std::string> lower_bound;
+  std::optional<std::string> upper_bound;
+
+  // When set, iterators return only keys beginning with this prefix. Prefix
+  // filtering is intersected with explicit bounds.
+  std::optional<std::string> prefix;
 };
 
 struct WriteOptions {
