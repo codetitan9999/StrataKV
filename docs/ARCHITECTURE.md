@@ -46,6 +46,10 @@ keeps only its current entry per source and the active decoded SSTable blocks in
 memory; it does not materialize all table contents. Newer sources win when keys
 overlap, tombstones hide older values, and block I/O or checksum failures are
 reported through `Iterator::status()` when traversal reaches the affected block.
+`ReadOptions` can provide an inclusive lower bound, an exclusive upper bound,
+and a prefix. These constraints are intersected, and each child iterator seeks
+directly to the effective start key so selective scans avoid decoding preceding
+blocks. The merge stops as soon as the upper bound or prefix range is exhausted.
 
 ### SSTables
 
@@ -143,6 +147,7 @@ Current tests cover:
 - Shared-cache reuse across readers and cache hit/miss accounting
 - Streaming iterator seek, version selection, tombstone hiding, and deferred
   block-error propagation across memtable and SSTables
+- Inclusive/exclusive range bounds and prefix filtering across table versions
 - Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
 - Manifest replay, invalid metadata rejection, checksum corruption detection, and missing table handling
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
@@ -158,14 +163,14 @@ The project starts with a tiny local harness to avoid dependency friction. Once 
 ## Benchmark Strategy
 
 The current benchmark measures local `Put` performance, then reopens the database
-and runs cold and warm random `Get` passes plus a full streaming scan against
-flushed SSTables and the final WAL tail. It reports throughput, latency
+and runs cold and warm random `Get` passes plus full and bounded streaming scans
+against flushed SSTables and the final WAL tail. It reports throughput, latency
 percentiles, and shared block-cache hits, misses, evictions, and usage.
 
 Future benchmark tracks:
 
 - sequential write throughput with sync off and sync on
-- bounded and selective range-scan throughput
+- prefix-scan throughput and selectivity
 - recovery time by WAL size
 - compaction throughput and write amplification
 - network request latency after Phase 2
@@ -191,7 +196,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 4: Iterators and Compaction
 
-- Add bounded range and prefix scan options
+- Move the merge frontier to a priority queue for high table counts
 - Add overlap-aware leveled compaction
 - Track read/write amplification in benchmarks
 

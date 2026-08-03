@@ -7,14 +7,14 @@ The API is small on purpose. The interesting part is inside the engine: how data
 ## What Works Today
 
 - C++20/CMake project structure
-- Public `stratakv::DB` API with `Put`, `Get`, `Delete`, and streaming iterator support
+- Public `stratakv::DB` API with `Put`, `Get`, `Delete`, and bounded streaming iterators
 - Sorted in-memory memtable
 - Binary write-ahead log with per-record checksums
 - Delete tombstones
 - WAL replay on reopen, including torn-tail recovery
 - Multi-block SSTables with per-block checksums and an on-disk index
 - Lazy SSTable block reads with a database-wide bounded LRU cache and metrics
-- Streaming merged scans across the memtable and SSTables
+- Streaming merged range and prefix scans across the memtable and SSTables
 - Memtable flush to SSTables with WAL rotation
 - Reads from both memtable and flushed SSTables
 - Manifest file with checksummed table metadata records
@@ -76,7 +76,7 @@ docs/               architecture notes
 
 ### Phase 1: Storage Engine
 
-- Bounded range-scan options and prefix-compressed SSTable blocks
+- Prefix-compressed SSTable blocks
 - More recovery and corruption tests
 - Benchmarks for writes, reads, scans, recovery, and compaction
 
