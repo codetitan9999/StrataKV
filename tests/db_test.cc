@@ -327,6 +327,39 @@ void IteratorSeeksAcrossVersions(TestRunner* runner) {
   runner->ExpectOk(it->status(), "seek merge iterator status");
 }
 
+void IteratorMergesManyTables(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.level0_compaction_trigger = 0;
+  auto db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+
+  for (int version = 0; version < 32; ++version) {
+    for (int key = 0; key < 8; ++key) {
+      std::ostringstream name;
+      name << "key-" << std::setw(2) << std::setfill('0') << key;
+      runner->ExpectOk(
+          db->Put(stratakv::WriteOptions{}, name.str(),
+                  "version-" + std::to_string(version)),
+          "put high-table-count version");
+    }
+  }
+  runner->Expect(CountSSTables(dir.path()) == 256,
+                 "test should create a high table count");
+
+  auto it = db->NewIterator(stratakv::ReadOptions{});
+  int visited = 0;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    runner->Expect(it->value() == "version-31",
+                   "newest value should win across many tables");
+    ++visited;
+  }
+  runner->ExpectOk(it->status(), "high-table-count iterator status");
+  runner->Expect(visited == 8,
+                 "high-table-count merge should emit every key once");
+}
+
 void IteratorHonorsBoundsAndPrefix(TestRunner* runner) {
   TempDir dir;
   stratakv::Options options;
@@ -521,6 +554,7 @@ int main() {
   FlushedTombstoneHidesOlderTableValue(&runner);
   IteratorMergesFlushedTables(&runner);
   IteratorSeeksAcrossVersions(&runner);
+  IteratorMergesManyTables(&runner);
   IteratorHonorsBoundsAndPrefix(&runner);
   IteratorReportsDeferredBlockErrors(&runner);
   MissingManifestTableFailsOpen(&runner);

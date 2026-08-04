@@ -1,5 +1,6 @@
 #include "merge_iterator.h"
 
+#include <queue>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -28,6 +29,7 @@ class MergingIterator final : public Iterator {
         child.iterator->Seek(*start);
       }
     }
+    RebuildFrontier();
     FindNext();
   }
 
@@ -39,15 +41,15 @@ class MergingIterator final : public Iterator {
       start = *bound;
     }
     for (auto& child : children_) child.iterator->Seek(start);
+    RebuildFrontier();
     FindNext();
   }
 
   void Next() override {
     if (!valid_) return;
-    for (auto& child : children_) {
-      if (child.iterator->Valid() && child.iterator->key() == key_) {
-        child.iterator->Next();
-      }
+    for (std::size_t index : current_sources_) {
+      children_[index].iterator->Next();
+      AddToFrontier(index);
     }
     FindNext();
   }
@@ -73,53 +75,67 @@ class MergingIterator final : public Iterator {
     return prefix_ && key > *prefix_ && !key.starts_with(*prefix_);
   }
 
+  struct FrontierEntry {
+    std::string key;
+    std::size_t child_index = 0;
+    std::size_t priority = 0;
+  };
+
+  struct FrontierCompare {
+    bool operator()(const FrontierEntry& left,
+                    const FrontierEntry& right) const {
+      if (left.key != right.key) return left.key > right.key;
+      return left.priority < right.priority;
+    }
+  };
+
+  void AddToFrontier(std::size_t index) {
+    const auto& child = children_[index];
+    if (child.iterator->Valid()) {
+      frontier_.push(
+          {std::string(child.iterator->key()), index, child.priority});
+    } else if (!child.iterator->status().ok() && status_.ok()) {
+      status_ = child.iterator->status();
+    }
+  }
+
+  void RebuildFrontier() {
+    frontier_ = {};
+    current_sources_.clear();
+    for (std::size_t i = 0; i < children_.size(); ++i) AddToFrontier(i);
+  }
+
   void FindNext() {
     valid_ = false;
     key_.clear();
     value_.clear();
 
     while (status_.ok()) {
-      for (const auto& child : children_) {
-        if (!child.iterator->status().ok()) {
-          status_ = child.iterator->status();
-          return;
-        }
-      }
-
-      std::string next_key;
-      bool found = false;
-      for (const auto& child : children_) {
-        if (child.iterator->Valid() &&
-            (!found || child.iterator->key() < next_key)) {
-          next_key = child.iterator->key();
-          found = true;
-        }
-      }
-      if (!found) return;
+      current_sources_.clear();
+      if (frontier_.empty()) return;
+      const std::string next_key = frontier_.top().key;
       if ((upper_bound_ && next_key >= *upper_bound_) || PastPrefix(next_key)) {
         return;
       }
 
-      MergeIteratorChild* winner = nullptr;
-      for (auto& child : children_) {
-        if (child.iterator->Valid() && child.iterator->key() == next_key &&
-            (winner == nullptr || child.priority > winner->priority)) {
-          winner = &child;
-        }
+      std::size_t winner_index = frontier_.top().child_index;
+      while (!frontier_.empty() && frontier_.top().key == next_key) {
+        current_sources_.push_back(frontier_.top().child_index);
+        frontier_.pop();
       }
+      const auto& winner = children_[winner_index];
 
-      if (winner->iterator->type() == RecordType::kPut &&
+      if (winner.iterator->type() == RecordType::kPut &&
           MatchesPrefix(next_key)) {
         key_ = next_key;
-        value_ = winner->iterator->value();
+        value_ = winner.iterator->value();
         valid_ = true;
         return;
       }
 
-      for (auto& child : children_) {
-        if (child.iterator->Valid() && child.iterator->key() == next_key) {
-          child.iterator->Next();
-        }
+      for (std::size_t index : current_sources_) {
+        children_[index].iterator->Next();
+        AddToFrontier(index);
       }
     }
   }
@@ -130,6 +146,10 @@ class MergingIterator final : public Iterator {
   std::optional<std::string> prefix_;
   std::string key_;
   std::string value_;
+  std::priority_queue<FrontierEntry, std::vector<FrontierEntry>,
+                      FrontierCompare>
+      frontier_;
+  std::vector<std::size_t> current_sources_;
   Status status_ = Status::OK();
   bool valid_ = false;
 };

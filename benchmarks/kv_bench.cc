@@ -37,6 +37,15 @@ std::string ValueFor(std::size_t i) {
   return value;
 }
 
+std::size_t CountSSTables(const std::filesystem::path& db_path) {
+  std::size_t count = 0;
+  for (const auto& entry :
+       std::filesystem::directory_iterator(db_path / "sst")) {
+    if (entry.path().extension() == ".sst") ++count;
+  }
+  return count;
+}
+
 double Seconds(Clock::duration duration) {
   return std::chrono::duration<double>(duration).count();
 }
@@ -53,6 +62,7 @@ int main(int argc, char** argv) {
   stratakv::Options options;
   options.write_buffer_size = 64 * 1024;
   options.block_cache_size = 8 * 1024 * 1024;
+  options.level0_compaction_trigger = 0;
   auto [db, open_status] = stratakv::DB::Open(options, db_path);
   if (!open_status.ok()) {
     std::cerr << "open failed: " << open_status << '\n';
@@ -149,6 +159,7 @@ int main(int argc, char** argv) {
   std::cout << "path: " << db_path << '\n';
   std::cout << "operations: " << operations << '\n';
   std::cout << "read source: reopened SSTables + final WAL tail\n";
+  std::cout << "scan merge sources: " << CountSSTables(db_path) + 1 << '\n';
   std::cout << "shared block cache: " << options.block_cache_size << " bytes\n";
   std::cout << "put throughput: "
             << operations / Seconds(write_duration) << " ops/sec\n";
