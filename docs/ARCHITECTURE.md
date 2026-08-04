@@ -40,7 +40,9 @@ Reads follow this order:
 Deletes are tombstones, not immediate removals from history. Compaction decides when a tombstone is safe to drop.
 
 Database iterators take a stable snapshot of the current source set and perform
-an incremental k-way merge. The mutable memtable is copied at iterator creation,
+an incremental k-way merge using a min-heap frontier. This makes each emitted
+key logarithmic in the number of active sources instead of scanning every
+source. The mutable memtable is copied at iterator creation,
 while immutable table readers are retained by shared ownership. The iterator
 keeps only its current entry per source and the active decoded SSTable blocks in
 memory; it does not materialize all table contents. Newer sources win when keys
@@ -148,6 +150,7 @@ Current tests cover:
 - Streaming iterator seek, version selection, tombstone hiding, and deferred
   block-error propagation across memtable and SSTables
 - Inclusive/exclusive range bounds and prefix filtering across table versions
+- High-table-count heap merging with newest-version selection
 - Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
 - Manifest replay, invalid metadata rejection, checksum corruption detection, and missing table handling
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
@@ -162,7 +165,8 @@ The project starts with a tiny local harness to avoid dependency friction. Once 
 
 ## Benchmark Strategy
 
-The current benchmark measures local `Put` performance, then reopens the database
+The current benchmark measures local `Put` performance with automatic
+compaction disabled to retain many scan sources, then reopens the database
 and runs cold and warm random `Get` passes plus full and bounded streaming scans
 against flushed SSTables and the final WAL tail. It reports throughput, latency
 percentiles, and shared block-cache hits, misses, evictions, and usage.
@@ -196,7 +200,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 4: Iterators and Compaction
 
-- Move the merge frontier to a priority queue for high table counts
+- Keep iterator snapshots readable across concurrent compaction cleanup
 - Add overlap-aware leveled compaction
 - Track read/write amplification in benchmarks
 

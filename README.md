@@ -14,7 +14,7 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - WAL replay on reopen, including torn-tail recovery
 - Multi-block SSTables with per-block checksums and an on-disk index
 - Lazy SSTable block reads with a database-wide bounded LRU cache and metrics
-- Streaming merged range and prefix scans across the memtable and SSTables
+- Heap-merged streaming range and prefix scans across the memtable and SSTables
 - Memtable flush to SSTables with WAL rotation
 - Reads from both memtable and flushed SSTables
 - Manifest file with checksummed table metadata records
