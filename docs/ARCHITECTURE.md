@@ -48,6 +48,10 @@ keeps only its current entry per source and the active decoded SSTable blocks in
 memory; it does not materialize all table contents. Newer sources win when keys
 overlap, tombstones hide older values, and block I/O or checksum failures are
 reported through `Iterator::status()` when traversal reaches the affected block.
+When compaction retires an SSTable, physical deletion is deferred until the
+last reader is released. Iterators can therefore continue lazy block reads from
+their pre-compaction snapshot, and obsolete files are reclaimed when the final
+snapshot releases them.
 `ReadOptions` can provide an inclusive lower bound, an exclusive upper bound,
 and a prefix. These constraints are intersected, and each child iterator seeks
 directly to the effective start key so selective scans avoid decoding preceding
@@ -151,6 +155,7 @@ Current tests cover:
   block-error propagation across memtable and SSTables
 - Inclusive/exclusive range bounds and prefix filtering across table versions
 - High-table-count heap merging with newest-version selection
+- Iterator snapshot lifetime across compaction and deferred obsolete-file cleanup
 - Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
 - Manifest replay, invalid metadata rejection, checksum corruption detection, and missing table handling
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
@@ -200,7 +205,6 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 4: Iterators and Compaction
 
-- Keep iterator snapshots readable across concurrent compaction cleanup
 - Add overlap-aware leveled compaction
 - Track read/write amplification in benchmarks
 
