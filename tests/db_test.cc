@@ -542,6 +542,40 @@ void CompactionDropsCoveredTombstones(TestRunner* runner) {
   runner->Expect(beta == "two", "beta should survive compaction");
 }
 
+void IteratorSurvivesCompactionCleanup(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.block_cache_size = 0;
+  options.level0_compaction_trigger = 3;
+
+  auto db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "a", "one"),
+                   "put a before iterator snapshot");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "b", "two"),
+                   "put b before iterator snapshot");
+  auto it = db->NewIterator(stratakv::ReadOptions{});
+
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "c", "three"),
+                   "put c to trigger compaction");
+  runner->Expect(CountSSTables(dir.path()) == 3,
+                 "pinned iterator should retain its two obsolete tables");
+
+  std::vector<std::string> keys;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    keys.emplace_back(it->key());
+  }
+  runner->ExpectOk(it->status(), "iterator status after compaction");
+  runner->Expect(keys == std::vector<std::string>({"a", "b"}),
+                 "iterator should retain its pre-compaction snapshot");
+
+  it.reset();
+  runner->Expect(CountSSTables(dir.path()) == 1,
+                 "obsolete tables should be removed after iterator release");
+}
+
 }  // namespace
 
 int main() {
@@ -560,5 +594,6 @@ int main() {
   MissingManifestTableFailsOpen(&runner);
   CompactsFlushedTables(&runner);
   CompactionDropsCoveredTombstones(&runner);
+  IteratorSurvivesCompactionCleanup(&runner);
   return runner.Finish();
 }

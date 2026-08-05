@@ -456,9 +456,8 @@ class DBImpl final : public DB {
       return manifest_status;
     }
 
-    for (std::uint64_t file_number : old_file_numbers) {
-      std::error_code ec;
-      std::filesystem::remove(TablePath(table_dir_, file_number), ec);
+    for (TableState& table : tables_) {
+      table.reader->MarkObsolete();
     }
 
     tables_ = std::move(next_tables);

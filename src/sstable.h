@@ -63,6 +63,8 @@ class SSTableBuilder {
 
 class SSTableReader : public std::enable_shared_from_this<SSTableReader> {
  public:
+  ~SSTableReader();
+
   static std::pair<std::shared_ptr<SSTableReader>, Status> Open(
       std::filesystem::path path,
       std::shared_ptr<BlockCache> block_cache = nullptr);
@@ -73,6 +75,9 @@ class SSTableReader : public std::enable_shared_from_this<SSTableReader> {
   [[nodiscard]] std::unique_ptr<InternalIterator> NewEntryIterator() const;
   [[nodiscard]] std::pair<std::vector<TableEntry>, Status> ReadAll() const;
   [[nodiscard]] const TableMetadata& metadata() const;
+
+  // Defers removal until the final reader/iterator releases this table.
+  void MarkObsolete();
 
  private:
   friend class SSTableEntryIterator;
@@ -88,6 +93,7 @@ class SSTableReader : public std::enable_shared_from_this<SSTableReader> {
   std::vector<TableEntry> legacy_entries_;
   TableMetadata metadata_;
   std::shared_ptr<BlockCache> block_cache_;
+  bool obsolete_ = false;
 };
 
 }  // namespace stratakv

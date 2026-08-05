@@ -578,6 +578,12 @@ std::pair<std::shared_ptr<SSTableReader>, Status> SSTableReader::Open(
   return {std::move(reader), Status::OK()};
 }
 
+SSTableReader::~SSTableReader() {
+  if (!obsolete_) return;
+  std::error_code ec;
+  std::filesystem::remove(path_, ec);
+}
+
 TableLookup SSTableReader::Lookup(std::string_view key) const {
   if (!legacy_entries_.empty()) {
     const auto it = std::lower_bound(
@@ -673,6 +679,8 @@ std::pair<std::vector<TableEntry>, Status> SSTableReader::ReadAll() const {
 }
 
 const TableMetadata& SSTableReader::metadata() const { return metadata_; }
+
+void SSTableReader::MarkObsolete() { obsolete_ = true; }
 
 SSTableReader::SSTableReader(
     std::filesystem::path path, std::vector<BlockIndexEntry> index,
