@@ -20,7 +20,7 @@ The public API is deliberately small. It should remain stable while internals ev
 ### Write Path
 
 - `src/wal.*`: append-only binary log with per-record checksums
-- `src/manifest.*`: append-only metadata log for installed SSTables
+- `src/manifest.*`: checksummed metadata log and compact snapshots for installed SSTables
 - `src/memtable.*`: sorted mutable map storing latest value or tombstone
 - `src/compaction.*`: merge logic for flushed SSTables
 - `src/db.cc`: coordinates WAL append, optional sync, memtable apply, flush, table loading, and recovery
@@ -87,13 +87,21 @@ work.
 
 ### Compaction
 
-`src/compaction.*` merges flushed SSTables in oldest-to-newest order. The first strategy is intentionally simple: when the number of flushed tables reaches `level0_compaction_trigger`, StrataKV compacts all active tables into one replacement table, records the replacement in the manifest, records old tables as deleted, and removes obsolete files.
+`src/compaction.*` merges flushed SSTables in oldest-to-newest order. The first strategy is intentionally simple: when the number of flushed tables reaches `level0_compaction_trigger`, StrataKV compacts all active tables into one replacement table, atomically installs a compact manifest snapshot containing the replacement, and removes obsolete files.
 
 Because this compaction covers every active table, tombstones that only protect against older tables can be dropped from the compacted output.
 
 ### Manifest
 
 `src/manifest.*` stores checksummed table metadata records. On open, StrataKV replays table-add and table-delete edits to decide which SSTables are installed, then replays the WAL for any writes that were not flushed. Directory scans are no longer the source of truth for table membership.
+
+Flushes append and flush a table-add record after installing the SSTable. Full
+compaction instead writes the complete active table set to `MANIFEST.tmp`,
+flushes and closes it, and atomically renames it over `MANIFEST`. A crash before
+the rename leaves the old manifest authoritative; a crash after it exposes the
+complete new snapshot. The writer is then reopened for later flush edits. This
+bounds manifest history at each compaction and makes orphaned pre-install files
+safe to ignore during recovery.
 
 ## Storage Model
 
@@ -157,7 +165,7 @@ Current tests cover:
 - High-table-count heap merging with newest-version selection
 - Iterator snapshot lifetime across compaction and deferred obsolete-file cleanup
 - Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
-- Manifest replay, invalid metadata rejection, checksum corruption detection, and missing table handling
+- Manifest replay, snapshot replacement, post-snapshot appends, invalid metadata rejection, checksum corruption detection, and missing table handling
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
 
 Next test layers should add:
@@ -200,7 +208,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 3: Flush and Recovery
 
-- Compact manifest snapshots
+- Add directory durability and fault injection around manifest snapshot installation
 - Add fault-injection tests around manifest/table installation
 
 ### Milestone 4: Iterators and Compaction

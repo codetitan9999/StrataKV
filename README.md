@@ -18,7 +18,7 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - Iterator snapshots that remain readable across compaction cleanup
 - Memtable flush to SSTables with WAL rotation
 - Reads from both memtable and flushed SSTables
-- Manifest file with checksummed table metadata records
+- Checksummed manifest records with atomic snapshot replacement during compaction
 - Automatic SSTable compaction with obsolete-file cleanup
 - Dependency-free unit tests
 - Local benchmark harness for throughput and latency
@@ -47,7 +47,7 @@ The write path is intentionally straightforward:
 4. Once the memtable crosses the write buffer limit, it is flushed to an immutable SSTable.
 5. A manifest record makes the new table discoverable on restart.
 6. The WAL is rotated after a successful flush.
-7. When enough flushed tables accumulate, compaction merges them into one table and records old tables as deleted.
+7. When enough flushed tables accumulate, compaction merges them into one table and atomically replaces the manifest with a compact snapshot.
 8. On restart, manifest-listed SSTables are loaded first, then the WAL is replayed up to the last complete record.
 
 The current database directory looks like this:
