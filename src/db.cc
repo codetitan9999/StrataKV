@@ -379,13 +379,9 @@ class DBImpl final : public DB {
   }
 
   Status CompactTables() {
-    std::vector<std::uint64_t> old_file_numbers;
-    old_file_numbers.reserve(tables_.size());
-
     CompactionInput input;
     input.tables.reserve(tables_.size());
     for (const TableState& table : tables_) {
-      old_file_numbers.push_back(table.file_number);
       input.tables.push_back(table.reader.get());
     }
 
@@ -436,22 +432,17 @@ class DBImpl final : public DB {
         return open_status;
       }
 
-      Status manifest_status = manifest_->AppendTable(metadata);
-      if (!manifest_status.ok()) {
-        return manifest_status;
-      }
-
       next_tables.push_back(TableState{file_number, std::move(reader)});
     }
 
-    for (std::uint64_t file_number : old_file_numbers) {
-      Status manifest_status = manifest_->DeleteTable(file_number);
-      if (!manifest_status.ok()) {
-        return manifest_status;
-      }
+    std::vector<TableMetadata> manifest_snapshot;
+    manifest_snapshot.reserve(next_tables.size());
+    for (const TableState& table : next_tables) {
+      manifest_snapshot.push_back(table.reader->metadata());
+      manifest_snapshot.back().file_number = table.file_number;
     }
-
-    Status manifest_status = manifest_->Sync();
+    Status manifest_status =
+        manifest_->ReplaceWithSnapshot(manifest_snapshot);
     if (!manifest_status.ok()) {
       return manifest_status;
     }

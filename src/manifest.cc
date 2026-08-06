@@ -248,6 +248,53 @@ Status ManifestWriter::Sync() {
   return Status::OK();
 }
 
+Status ManifestWriter::ReplaceWithSnapshot(
+    const std::vector<TableMetadata>& tables) {
+  const std::filesystem::path temporary_path = path_.string() + ".tmp";
+
+  ManifestWriter snapshot(temporary_path);
+  Status status = snapshot.Open(/*append=*/false);
+  if (!status.ok()) {
+    return status;
+  }
+  for (const TableMetadata& table : tables) {
+    status = snapshot.AppendTable(table);
+    if (!status.ok()) {
+      std::error_code ignored;
+      std::filesystem::remove(temporary_path, ignored);
+      return status;
+    }
+  }
+  status = snapshot.Sync();
+  if (!status.ok()) {
+    std::error_code ignored;
+    std::filesystem::remove(temporary_path, ignored);
+    return status;
+  }
+  snapshot.stream_.close();
+  if (!snapshot.stream_) {
+    std::error_code ignored;
+    std::filesystem::remove(temporary_path, ignored);
+    return Status::IOError("failed to close manifest snapshot");
+  }
+
+  stream_.close();
+  std::error_code ec;
+  std::filesystem::rename(temporary_path, path_, ec);
+  if (ec) {
+    Status reopen_status = Open(/*append=*/true);
+    std::error_code ignored;
+    std::filesystem::remove(temporary_path, ignored);
+    if (!reopen_status.ok()) {
+      return reopen_status;
+    }
+    return Status::IOError("failed to install manifest snapshot: " +
+                           ec.message());
+  }
+
+  return Open(/*append=*/true);
+}
+
 ManifestReader::ManifestReader(std::filesystem::path path)
     : path_(std::move(path)) {}
 

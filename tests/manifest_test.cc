@@ -179,6 +179,39 @@ void DetectsChecksumMismatch(TestRunner* runner) {
                  "manifest checksum mismatch should be detected");
 }
 
+void ReplacesHistoryWithSnapshot(TestRunner* runner) {
+  TempDir dir;
+  const auto manifest_path = dir.path() / "MANIFEST";
+
+  stratakv::ManifestWriter writer(manifest_path);
+  runner->ExpectOk(writer.Open(/*append=*/false), "open manifest writer");
+  runner->ExpectOk(writer.AppendTable(Metadata(1, "a", "c")),
+                   "append obsolete table");
+  runner->ExpectOk(writer.DeleteTable(1), "delete obsolete table");
+  runner->ExpectOk(
+      writer.ReplaceWithSnapshot({Metadata(2, "d", "f")}),
+      "replace manifest with snapshot");
+  runner->ExpectOk(writer.AppendTable(Metadata(3, "g", "i")),
+                   "append after snapshot replacement");
+  runner->ExpectOk(writer.Sync(), "sync appended manifest edit");
+
+  std::vector<std::uint64_t> file_numbers;
+  stratakv::ManifestReader reader(manifest_path);
+  runner->ExpectOk(reader.Replay([&](const stratakv::ManifestEdit& edit) {
+                     runner->Expect(
+                         edit.type == stratakv::ManifestEditType::kTableAdded,
+                         "snapshot should contain only table additions");
+                     file_numbers.push_back(edit.file_number);
+                     return stratakv::Status::OK();
+                   }),
+                   "replay compacted manifest");
+
+  runner->Expect(file_numbers == std::vector<std::uint64_t>({2, 3}),
+                 "snapshot should replace obsolete manifest history");
+  runner->Expect(!std::filesystem::exists(manifest_path.string() + ".tmp"),
+                 "installed snapshot should not leave a temporary file");
+}
+
 }  // namespace
 
 int main() {
@@ -188,5 +221,6 @@ int main() {
   ReplaysTableDeletions(&runner);
   RejectsInvalidDeletions(&runner);
   DetectsChecksumMismatch(&runner);
+  ReplacesHistoryWithSnapshot(&runner);
   return runner.Finish();
 }

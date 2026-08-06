@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <vector>
 
 #include "sstable.h"
 #include "stratakv/status.h"
@@ -29,6 +30,7 @@ class ManifestWriter {
   Status AppendTable(const TableMetadata& metadata);
   Status DeleteTable(std::uint64_t file_number);
   Status Sync();
+  Status ReplaceWithSnapshot(const std::vector<TableMetadata>& tables);
 
  private:
   std::filesystem::path path_;
