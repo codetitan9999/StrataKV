@@ -23,6 +23,8 @@ The public API is deliberately small. It should remain stable while internals ev
 - `src/manifest.*`: checksummed metadata log and compact snapshots for installed SSTables
 - `src/memtable.*`: sorted mutable map storing latest value or tombstone
 - `src/compaction.*`: merge logic for flushed SSTables
+- `src/file_system.*`: durability-critical file sync, rename, directory sync,
+  and injectable failure boundaries
 - `src/db.cc`: coordinates WAL append, optional sync, memtable apply, flush, table loading, and recovery
 
 Current write order is WAL first, memtable second. When the memtable crosses the configured write buffer size, it is written to a numbered SSTable, recorded in the manifest, and then the WAL is rotated.
@@ -97,11 +99,15 @@ Because this compaction covers every active table, tombstones that only protect 
 
 Flushes append and flush a table-add record after installing the SSTable. Full
 compaction instead writes the complete active table set to `MANIFEST.tmp`,
-flushes and closes it, and atomically renames it over `MANIFEST`. A crash before
-the rename leaves the old manifest authoritative; a crash after it exposes the
-complete new snapshot. The writer is then reopened for later flush edits. This
-bounds manifest history at each compaction and makes orphaned pre-install files
-safe to ignore during recovery.
+syncs and closes it, atomically renames it over `MANIFEST`, and syncs the
+database directory. A crash before the rename leaves the old manifest
+authoritative; a crash after the directory sync exposes the complete new
+snapshot. The writer is then reopened for later flush edits. This bounds
+manifest history at each compaction and makes orphaned pre-install files safe
+to ignore during recovery. Flush and compaction SSTables follow the same
+write/sync/rename/directory-sync installation sequence before their metadata is
+published. These boundaries use an injectable filesystem interface so failures
+can be tested deterministically.
 
 ## Storage Model
 
@@ -166,6 +172,8 @@ Current tests cover:
 - Iterator snapshot lifetime across compaction and deferred obsolete-file cleanup
 - Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
 - Manifest replay, snapshot replacement, post-snapshot appends, invalid metadata rejection, checksum corruption detection, and missing table handling
+- File-sync, rename, and directory-sync ordering plus injected SSTable and
+  manifest installation failures
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
 
 Next test layers should add:
@@ -200,7 +208,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 - Add version-set types
 - Add structured logging around open/recovery
-- Add fault-injection hooks for filesystem operations
+- Extend filesystem fault injection to reads, writes, and WAL operations
 
 ### Milestone 2: SSTable Format
 
@@ -208,8 +216,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 3: Flush and Recovery
 
-- Add directory durability and fault injection around manifest snapshot installation
-- Add fault-injection tests around manifest/table installation
+- Add crash-point recovery tests for WAL rotation and directory creation
 
 ### Milestone 4: Iterators and Compaction
 
