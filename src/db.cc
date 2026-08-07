@@ -1,4 +1,5 @@
 #include "stratakv/db.h"
+#include "stratakv/file_system.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -56,6 +57,8 @@ class DBImpl final : public DB {
   DBImpl(Options options, std::filesystem::path path)
       : options_(options),
         db_path_(std::move(path)),
+        file_system_(options.file_system ? options.file_system
+                                         : DefaultFileSystem()),
         block_cache_(std::make_shared<BlockCache>(options.block_cache_size)) {}
 
   Status OpenInternal() {
@@ -99,7 +102,7 @@ class DBImpl final : public DB {
       return table_status;
     }
 
-    manifest_ = std::make_unique<ManifestWriter>(manifest_path_);
+    manifest_ = std::make_unique<ManifestWriter>(manifest_path_, file_system_);
     Status manifest_status = manifest_->Open(/*append=*/true);
     if (!manifest_status.ok()) {
       return manifest_status;
@@ -336,11 +339,17 @@ class DBImpl final : public DB {
     metadata.file_number = file_number;
     metadata.file_path = final_path;
 
-    std::error_code ec;
-    std::filesystem::rename(temporary_path, final_path, ec);
-    if (ec) {
-      return Status::IOError("failed to install SSTable " +
-                             final_path.string() + ": " + ec.message());
+    Status install_status = file_system_->SyncFile(temporary_path);
+    if (!install_status.ok()) {
+      return install_status;
+    }
+    install_status = file_system_->Rename(temporary_path, final_path);
+    if (!install_status.ok()) {
+      return install_status;
+    }
+    install_status = file_system_->SyncDirectory(table_dir_);
+    if (!install_status.ok()) {
+      return install_status;
     }
 
     Status manifest_status = manifest_->AppendTable(metadata);
@@ -419,11 +428,17 @@ class DBImpl final : public DB {
       metadata.file_number = file_number;
       metadata.file_path = final_path;
 
-      std::error_code ec;
-      std::filesystem::rename(temporary_path, final_path, ec);
-      if (ec) {
-        return Status::IOError("failed to install compacted SSTable " +
-                               final_path.string() + ": " + ec.message());
+      Status install_status = file_system_->SyncFile(temporary_path);
+      if (!install_status.ok()) {
+        return install_status;
+      }
+      install_status = file_system_->Rename(temporary_path, final_path);
+      if (!install_status.ok()) {
+        return install_status;
+      }
+      install_status = file_system_->SyncDirectory(table_dir_);
+      if (!install_status.ok()) {
+        return install_status;
       }
 
       auto [reader, open_status] =
@@ -488,6 +503,7 @@ class DBImpl final : public DB {
   std::uint64_t next_file_number_ = 1;
   std::unique_ptr<ManifestWriter> manifest_;
   std::unique_ptr<WalWriter> wal_;
+  std::shared_ptr<FileSystem> file_system_;
   std::shared_ptr<BlockCache> block_cache_;
 };
 

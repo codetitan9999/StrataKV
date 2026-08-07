@@ -14,6 +14,7 @@ add_library(stratakv
   src/block_cache.cc
   src/compaction.cc
   src/db.cc
+  src/file_system.cc
   src/manifest.cc
   src/memtable.cc
   src/merge_iterator.cc

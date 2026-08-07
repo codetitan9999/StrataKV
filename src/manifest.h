@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "sstable.h"
+#include "stratakv/file_system.h"
 #include "stratakv/status.h"
 
 namespace stratakv {
@@ -24,7 +25,9 @@ struct ManifestEdit {
 
 class ManifestWriter {
  public:
-  explicit ManifestWriter(std::filesystem::path path);
+  explicit ManifestWriter(
+      std::filesystem::path path,
+      std::shared_ptr<FileSystem> file_system = DefaultFileSystem());
 
   Status Open(bool append);
   Status AppendTable(const TableMetadata& metadata);
@@ -35,6 +38,7 @@ class ManifestWriter {
  private:
   std::filesystem::path path_;
   std::ofstream stream_;
+  std::shared_ptr<FileSystem> file_system_;
 };
 
 class ManifestReader {

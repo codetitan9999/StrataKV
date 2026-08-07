@@ -9,6 +9,8 @@
 #include <utility>
 #include <vector>
 
+#include "stratakv/file_system.h"
+
 namespace {
 
 class TempDir {
@@ -56,6 +58,45 @@ class TestRunner {
 
  private:
   int failures_ = 0;
+};
+
+class RecordingFileSystem final : public stratakv::FileSystem {
+ public:
+  stratakv::Status SyncFile(const std::filesystem::path& path) override {
+    calls.push_back("file:" + path.filename().string());
+    return delegate_->SyncFile(path);
+  }
+
+  stratakv::Status Rename(const std::filesystem::path& from,
+                          const std::filesystem::path& to) override {
+    calls.push_back("rename:" + from.filename().string() + ":" +
+                    to.filename().string());
+    if (fail_rename) {
+      return stratakv::Status::IOError("injected rename failure");
+    }
+    return delegate_->Rename(from, to);
+  }
+
+  stratakv::Status SyncDirectory(const std::filesystem::path& path) override {
+    calls.push_back("dir:" + path.filename().string());
+    if (fail_directory_sync) {
+      return stratakv::Status::IOError("injected directory sync failure");
+    }
+    return delegate_->SyncDirectory(path);
+  }
+
+  stratakv::Status Remove(const std::filesystem::path& path) override {
+    calls.push_back("remove:" + path.filename().string());
+    return delegate_->Remove(path);
+  }
+
+  bool fail_rename = false;
+  bool fail_directory_sync = false;
+  std::vector<std::string> calls;
+
+ private:
+  std::shared_ptr<stratakv::FileSystem> delegate_ =
+      stratakv::DefaultFileSystem();
 };
 
 stratakv::TableMetadata Metadata(std::uint64_t file_number,
@@ -212,6 +253,48 @@ void ReplacesHistoryWithSnapshot(TestRunner* runner) {
                  "installed snapshot should not leave a temporary file");
 }
 
+void SyncsSnapshotInstallation(TestRunner* runner) {
+  TempDir dir;
+  auto file_system = std::make_shared<RecordingFileSystem>();
+  stratakv::ManifestWriter writer(dir.path() / "MANIFEST", file_system);
+  runner->ExpectOk(writer.Open(/*append=*/false), "open manifest writer");
+  runner->ExpectOk(writer.ReplaceWithSnapshot({Metadata(1, "a", "z")}),
+                   "durably replace manifest snapshot");
+  runner->Expect(
+      file_system->calls ==
+          std::vector<std::string>({"file:MANIFEST.tmp",
+                                    "rename:MANIFEST.tmp:MANIFEST",
+                                    "dir:" + dir.path().filename().string()}),
+      "snapshot should sync file, rename, then sync parent directory");
+}
+
+void PreservesManifestWhenSnapshotRenameFails(TestRunner* runner) {
+  TempDir dir;
+  auto file_system = std::make_shared<RecordingFileSystem>();
+  stratakv::ManifestWriter writer(dir.path() / "MANIFEST", file_system);
+  runner->ExpectOk(writer.Open(/*append=*/false), "open manifest writer");
+  runner->ExpectOk(writer.AppendTable(Metadata(1, "a", "c")),
+                   "append original manifest table");
+  runner->ExpectOk(writer.Sync(), "sync original manifest");
+
+  file_system->fail_rename = true;
+  const stratakv::Status status =
+      writer.ReplaceWithSnapshot({Metadata(2, "d", "f")});
+  runner->Expect(!status.ok(), "injected rename failure should be reported");
+  runner->Expect(!std::filesystem::exists(dir.path() / "MANIFEST.tmp"),
+                 "failed snapshot should clean up its temporary file");
+
+  std::vector<std::uint64_t> files;
+  stratakv::ManifestReader reader(dir.path() / "MANIFEST");
+  runner->ExpectOk(reader.Replay([&](const stratakv::ManifestEdit& edit) {
+                     files.push_back(edit.file_number);
+                     return stratakv::Status::OK();
+                   }),
+                   "replay original manifest after failed rename");
+  runner->Expect(files == std::vector<std::uint64_t>({1}),
+                 "failed rename should leave old manifest authoritative");
+}
+
 }  // namespace
 
 int main() {
@@ -222,5 +305,7 @@ int main() {
   RejectsInvalidDeletions(&runner);
   DetectsChecksumMismatch(&runner);
   ReplacesHistoryWithSnapshot(&runner);
+  SyncsSnapshotInstallation(&runner);
+  PreservesManifestWhenSnapshotRenameFails(&runner);
   return runner.Finish();
 }

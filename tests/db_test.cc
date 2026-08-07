@@ -1,4 +1,5 @@
 #include "stratakv/db.h"
+#include "stratakv/file_system.h"
 
 #include <chrono>
 #include <filesystem>
@@ -59,6 +60,30 @@ class TestRunner {
   int failures_ = 0;
 };
 
+class FailingRenameFileSystem final : public stratakv::FileSystem {
+ public:
+  stratakv::Status SyncFile(const std::filesystem::path& path) override {
+    ++file_syncs;
+    return delegate_->SyncFile(path);
+  }
+  stratakv::Status Rename(const std::filesystem::path&,
+                          const std::filesystem::path&) override {
+    return stratakv::Status::IOError("injected SSTable rename failure");
+  }
+  stratakv::Status SyncDirectory(const std::filesystem::path& path) override {
+    return delegate_->SyncDirectory(path);
+  }
+  stratakv::Status Remove(const std::filesystem::path& path) override {
+    return delegate_->Remove(path);
+  }
+
+  int file_syncs = 0;
+
+ private:
+  std::shared_ptr<stratakv::FileSystem> delegate_ =
+      stratakv::DefaultFileSystem();
+};
+
 std::unique_ptr<stratakv::DB> OpenOrFail(TestRunner* runner,
                                          const std::filesystem::path& path) {
   auto [db, status] = stratakv::DB::Open(stratakv::Options{}, path);
@@ -87,6 +112,28 @@ int CountSSTables(const std::filesystem::path& db_path) {
     }
   }
   return count;
+}
+
+void ReportsSSTableInstallFailureBeforeManifestEdit(TestRunner* runner) {
+  TempDir dir;
+  auto file_system = std::make_shared<FailingRenameFileSystem>();
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.level0_compaction_trigger = 0;
+  options.file_system = file_system;
+  auto db = OpenOrFail(runner, dir.path(), options);
+
+  const stratakv::Status status =
+      db->Put(stratakv::WriteOptions{}, "key", "value");
+  runner->Expect(!status.ok(), "SSTable rename failure should fail the write");
+  runner->Expect(file_system->file_syncs == 1,
+                 "SSTable temporary file should be synced before rename");
+  runner->Expect(CountSSTables(dir.path()) == 0,
+                 "failed installation should not expose an SSTable");
+
+  db.reset();
+  runner->Expect(std::filesystem::file_size(dir.path() / "MANIFEST") == 0,
+                 "manifest should not reference an uninstalled SSTable");
 }
 
 void PutGetDeleteRoundTrip(TestRunner* runner) {
@@ -580,6 +627,7 @@ void IteratorSurvivesCompactionCleanup(TestRunner* runner) {
 
 int main() {
   TestRunner runner;
+  ReportsSSTableInstallFailureBeforeManifestEdit(&runner);
   PutGetDeleteRoundTrip(&runner);
   IteratorOrdersLiveKeys(&runner);
   ReplaysWalOnReopen(&runner);

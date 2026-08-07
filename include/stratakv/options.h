@@ -3,9 +3,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <memory>
 #include <string>
 
 namespace stratakv {
+
+class FileSystem;
 
 struct Options {
   bool create_if_missing = true;
@@ -25,9 +28,13 @@ struct Options {
   // A value of 0 disables automatic compaction.
   std::size_t level0_compaction_trigger = 4;
 
-  // Current implementation flushes the WAL stream; durable fsync is a later
-  // platform-specific storage milestone.
+  // Flush the WAL stream after each write. Durable descriptor-level WAL sync
+  // remains a separate follow-up milestone.
   bool fsync_wal = false;
+
+  // Optional filesystem implementation for durability operations and fault
+  // injection. A null pointer selects the platform default.
+  std::shared_ptr<FileSystem> file_system;
 };
 
 struct ReadOptions {

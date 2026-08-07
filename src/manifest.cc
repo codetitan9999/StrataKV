@@ -181,8 +181,9 @@ Status DecodeRecord(std::string_view payload, ManifestEdit* edit) {
 
 }  // namespace
 
-ManifestWriter::ManifestWriter(std::filesystem::path path)
-    : path_(std::move(path)) {}
+ManifestWriter::ManifestWriter(std::filesystem::path path,
+                               std::shared_ptr<FileSystem> file_system)
+    : path_(std::move(path)), file_system_(std::move(file_system)) {}
 
 Status ManifestWriter::Open(bool append) {
   const auto mode = std::ios::binary | std::ios::out |
@@ -245,14 +246,14 @@ Status ManifestWriter::Sync() {
   if (!stream_) {
     return Status::IOError("failed to flush manifest");
   }
-  return Status::OK();
+  return file_system_->SyncFile(path_);
 }
 
 Status ManifestWriter::ReplaceWithSnapshot(
     const std::vector<TableMetadata>& tables) {
   const std::filesystem::path temporary_path = path_.string() + ".tmp";
 
-  ManifestWriter snapshot(temporary_path);
+  ManifestWriter snapshot(temporary_path, file_system_);
   Status status = snapshot.Open(/*append=*/false);
   if (!status.ok()) {
     return status;
@@ -279,17 +280,20 @@ Status ManifestWriter::ReplaceWithSnapshot(
   }
 
   stream_.close();
-  std::error_code ec;
-  std::filesystem::rename(temporary_path, path_, ec);
-  if (ec) {
+  status = file_system_->Rename(temporary_path, path_);
+  if (!status.ok()) {
     Status reopen_status = Open(/*append=*/true);
-    std::error_code ignored;
-    std::filesystem::remove(temporary_path, ignored);
+    file_system_->Remove(temporary_path);
     if (!reopen_status.ok()) {
       return reopen_status;
     }
-    return Status::IOError("failed to install manifest snapshot: " +
-                           ec.message());
+    return status;
+  }
+
+  status = file_system_->SyncDirectory(path_.parent_path());
+  if (!status.ok()) {
+    Status reopen_status = Open(/*append=*/true);
+    return reopen_status.ok() ? status : reopen_status;
   }
 
   return Open(/*append=*/true);
