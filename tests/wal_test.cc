@@ -1,4 +1,5 @@
 #include "wal.h"
+#include "stratakv/file_system.h"
 
 #include <chrono>
 #include <filesystem>
@@ -54,6 +55,31 @@ class TestRunner {
 
  private:
   int failures_ = 0;
+};
+
+class RecordingFileSystem final : public stratakv::FileSystem {
+ public:
+  stratakv::Status SyncFile(const std::filesystem::path& path) override {
+    synced_files.push_back(path.filename().string());
+    return delegate_->SyncFile(path);
+  }
+  stratakv::Status Rename(const std::filesystem::path& from,
+                          const std::filesystem::path& to) override {
+    return delegate_->Rename(from, to);
+  }
+  stratakv::Status SyncDirectory(
+      const std::filesystem::path& path) override {
+    return delegate_->SyncDirectory(path);
+  }
+  stratakv::Status Remove(const std::filesystem::path& path) override {
+    return delegate_->Remove(path);
+  }
+
+  std::vector<std::string> synced_files;
+
+ private:
+  std::shared_ptr<stratakv::FileSystem> delegate_ =
+      stratakv::DefaultFileSystem();
 };
 
 void AppendRecord(TestRunner* runner, const std::filesystem::path& path,
@@ -177,6 +203,22 @@ void DetectsChecksumMismatch(TestRunner* runner) {
   runner->Expect(records.empty(), "corrupt record should not replay");
 }
 
+void SyncsWalFile(TestRunner* runner) {
+  TempDir dir;
+  const auto path = dir.path() / "current.log";
+  auto file_system = std::make_shared<RecordingFileSystem>();
+  stratakv::WalWriter writer(path, file_system);
+  runner->ExpectOk(writer.Open(/*append=*/false), "open synced WAL");
+  runner->ExpectOk(
+      writer.Append(stratakv::LogRecord{stratakv::RecordType::kPut, 1,
+                                        "alpha", "one"}),
+      "append synced WAL record");
+  runner->ExpectOk(writer.Sync(), "durably sync WAL");
+  runner->Expect(file_system->synced_files ==
+                     std::vector<std::string>({"current.log"}),
+                 "WAL sync should reach the filesystem durability boundary");
+}
+
 }  // namespace
 
 int main() {
@@ -185,5 +227,6 @@ int main() {
   IgnoresTornTrailingHeader(&runner);
   IgnoresTornTrailingPayload(&runner);
   DetectsChecksumMismatch(&runner);
+  SyncsWalFile(&runner);
   return runner.Finish();
 }

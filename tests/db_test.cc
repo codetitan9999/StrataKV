@@ -63,7 +63,9 @@ class TestRunner {
 class FailingRenameFileSystem final : public stratakv::FileSystem {
  public:
   stratakv::Status SyncFile(const std::filesystem::path& path) override {
-    ++file_syncs;
+    if (path.parent_path().filename() == "sst") {
+      ++file_syncs;
+    }
     return delegate_->SyncFile(path);
   }
   stratakv::Status Rename(const std::filesystem::path&,
@@ -80,6 +82,39 @@ class FailingRenameFileSystem final : public stratakv::FileSystem {
   int file_syncs = 0;
 
  private:
+  std::shared_ptr<stratakv::FileSystem> delegate_ =
+      stratakv::DefaultFileSystem();
+};
+
+class FailingWalRotationFileSystem final : public stratakv::FileSystem {
+ public:
+  stratakv::Status SyncFile(const std::filesystem::path& path) override {
+    return delegate_->SyncFile(path);
+  }
+  stratakv::Status Rename(const std::filesystem::path& from,
+                          const std::filesystem::path& to) override {
+    const stratakv::Status status = delegate_->Rename(from, to);
+    if (status.ok() && from.filename() == "current.log" &&
+        to.filename() == "previous.log") {
+      fail_next_wal_directory_sync_ = true;
+    }
+    return status;
+  }
+  stratakv::Status SyncDirectory(
+      const std::filesystem::path& path) override {
+    if (fail_next_wal_directory_sync_ && path.filename() == "wal") {
+      fail_next_wal_directory_sync_ = false;
+      return stratakv::Status::IOError(
+          "injected WAL directory sync failure");
+    }
+    return delegate_->SyncDirectory(path);
+  }
+  stratakv::Status Remove(const std::filesystem::path& path) override {
+    return delegate_->Remove(path);
+  }
+
+ private:
+  bool fail_next_wal_directory_sync_ = false;
   std::shared_ptr<stratakv::FileSystem> delegate_ =
       stratakv::DefaultFileSystem();
 };
@@ -134,6 +169,37 @@ void ReportsSSTableInstallFailureBeforeManifestEdit(TestRunner* runner) {
   db.reset();
   runner->Expect(std::filesystem::file_size(dir.path() / "MANIFEST") == 0,
                  "manifest should not reference an uninstalled SSTable");
+}
+
+void RecoversWalInterruptedAfterRename(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.level0_compaction_trigger = 0;
+  options.file_system = std::make_shared<FailingWalRotationFileSystem>();
+
+  auto db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+  const stratakv::Status write_status =
+      db->Put(stratakv::WriteOptions{.sync = true}, "alpha", "one");
+  runner->Expect(!write_status.ok(),
+                 "injected WAL rotation failure should fail the write");
+  runner->Expect(std::filesystem::exists(dir.path() / "wal" / "previous.log"),
+                 "renamed WAL should remain recoverable after interruption");
+  runner->Expect(!std::filesystem::exists(dir.path() / "wal" / "current.log"),
+                 "interruption should occur before the new WAL is created");
+  db.reset();
+
+  stratakv::Options reopen_options;
+  reopen_options.write_buffer_size = 1;
+  reopen_options.level0_compaction_trigger = 0;
+  auto reopened = OpenOrFail(runner, dir.path(), reopen_options);
+  if (!reopened) return;
+  auto [value, get_status] =
+      reopened->Get(stratakv::ReadOptions{}, "alpha");
+  runner->ExpectOk(get_status, "get value after interrupted WAL rotation");
+  runner->Expect(value == "one",
+                 "retired WAL should preserve acknowledged writes");
 }
 
 void PutGetDeleteRoundTrip(TestRunner* runner) {
@@ -628,6 +694,7 @@ void IteratorSurvivesCompactionCleanup(TestRunner* runner) {
 int main() {
   TestRunner runner;
   ReportsSSTableInstallFailureBeforeManifestEdit(&runner);
+  RecoversWalInterruptedAfterRename(&runner);
   PutGetDeleteRoundTrip(&runner);
   IteratorOrdersLiveKeys(&runner);
   ReplaysWalOnReopen(&runner);

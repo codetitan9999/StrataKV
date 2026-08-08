@@ -101,7 +101,9 @@ Status DecodeRecord(std::string_view payload, LogRecord* record) {
 
 }  // namespace
 
-WalWriter::WalWriter(std::filesystem::path path) : path_(std::move(path)) {}
+WalWriter::WalWriter(std::filesystem::path path,
+                     std::shared_ptr<FileSystem> file_system)
+    : path_(std::move(path)), file_system_(std::move(file_system)) {}
 
 WalWriter::~WalWriter() = default;
 
@@ -143,6 +145,14 @@ Status WalWriter::Sync() {
   stream_.flush();
   if (!stream_) {
     return Status::IOError("failed to flush WAL");
+  }
+  return file_system_->SyncFile(path_);
+}
+
+Status WalWriter::Close() {
+  stream_.close();
+  if (stream_.fail()) {
+    return Status::IOError("failed to close WAL: " + path_.string());
   }
   return Status::OK();
 }

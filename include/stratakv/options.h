@@ -28,8 +28,7 @@ struct Options {
   // A value of 0 disables automatic compaction.
   std::size_t level0_compaction_trigger = 4;
 
-  // Flush the WAL stream after each write. Durable descriptor-level WAL sync
-  // remains a separate follow-up milestone.
+  // Durably sync the WAL file after each write.
   bool fsync_wal = false;
 
   // Optional filesystem implementation for durability operations and fault

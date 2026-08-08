@@ -109,8 +109,19 @@ class DBImpl final : public DB {
     }
 
     wal_path_ = wal_dir_ / "current.log";
-    if (std::filesystem::exists(wal_path_, ec)) {
-      Status recover_status = Recover();
+    retired_wal_path_ = wal_dir_ / "previous.log";
+    if (std::filesystem::exists(retired_wal_path_, ec)) {
+      Status recover_status = Recover(retired_wal_path_);
+      if (!recover_status.ok()) {
+        return recover_status;
+      }
+    } else if (ec) {
+      return Status::IOError("failed to inspect retired WAL path " +
+                             retired_wal_path_.string() + ": " + ec.message());
+    }
+    const bool wal_exists = std::filesystem::exists(wal_path_, ec);
+    if (wal_exists) {
+      Status recover_status = Recover(wal_path_);
       if (!recover_status.ok()) {
         return recover_status;
       }
@@ -119,8 +130,16 @@ class DBImpl final : public DB {
                              wal_path_.string() + ": " + ec.message());
     }
 
-    wal_ = std::make_unique<WalWriter>(wal_path_);
-    return wal_->Open(/*append=*/true);
+    wal_ = std::make_unique<WalWriter>(wal_path_, file_system_);
+    Status wal_status = wal_->Open(/*append=*/true);
+    if (!wal_status.ok() || wal_exists) {
+      return wal_status;
+    }
+    wal_status = wal_->Sync();
+    if (!wal_status.ok()) {
+      return wal_status;
+    }
+    return file_system_->SyncDirectory(wal_dir_);
   }
 
   Status Put(const WriteOptions& write_options, std::string_view key,
@@ -293,8 +312,8 @@ class DBImpl final : public DB {
     return Status::OK();
   }
 
-  Status Recover() {
-    WalReader reader(wal_path_);
+  Status Recover(const std::filesystem::path& path) {
+    WalReader reader(path);
     return reader.Replay([this](const LogRecord& record) {
       last_sequence_ = std::max(last_sequence_, record.sequence);
       return memtable_.Apply(record);
@@ -476,17 +495,42 @@ class DBImpl final : public DB {
       if (!sync_status.ok()) {
         return sync_status;
       }
+      Status close_status = wal_->Close();
+      if (!close_status.ok()) {
+        return close_status;
+      }
       wal_.reset();
     }
 
-    auto next_wal = std::make_unique<WalWriter>(wal_path_);
+    Status rotate_status = file_system_->Rename(wal_path_, retired_wal_path_);
+    if (!rotate_status.ok()) {
+      return rotate_status;
+    }
+    rotate_status = file_system_->SyncDirectory(wal_dir_);
+    if (!rotate_status.ok()) {
+      return rotate_status;
+    }
+
+    auto next_wal = std::make_unique<WalWriter>(wal_path_, file_system_);
     Status open_status = next_wal->Open(/*append=*/false);
     if (!open_status.ok()) {
       return open_status;
     }
+    Status sync_status = next_wal->Sync();
+    if (!sync_status.ok()) {
+      return sync_status;
+    }
+    sync_status = file_system_->SyncDirectory(wal_dir_);
+    if (!sync_status.ok()) {
+      return sync_status;
+    }
 
     wal_ = std::move(next_wal);
-    return Status::OK();
+    Status remove_status = file_system_->Remove(retired_wal_path_);
+    if (!remove_status.ok()) {
+      return remove_status;
+    }
+    return file_system_->SyncDirectory(wal_dir_);
   }
 
   Options options_;
@@ -495,6 +539,7 @@ class DBImpl final : public DB {
   std::filesystem::path table_dir_;
   std::filesystem::path manifest_path_;
   std::filesystem::path wal_path_;
+  std::filesystem::path retired_wal_path_;
 
   mutable std::mutex mu_;
   MemTable memtable_;
