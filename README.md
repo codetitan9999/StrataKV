@@ -9,7 +9,7 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - C++20/CMake project structure
 - Public `stratakv::DB` API with `Put`, `Get`, `Delete`, and bounded streaming iterators
 - Sorted in-memory memtable
-- Binary write-ahead log with per-record checksums
+- Descriptor-synced binary write-ahead log with per-record checksums
 - Delete tombstones
 - WAL replay on reopen, including torn-tail recovery
 - Multi-block SSTables with per-block checksums and an on-disk index
@@ -48,7 +48,8 @@ The write path is intentionally straightforward:
 4. Once the memtable crosses the write buffer limit, it is flushed to an immutable SSTable.
 5. The table file is synced and installed with a directory sync, then a synced
    manifest record makes it discoverable on restart.
-6. The WAL is rotated after a successful flush.
+6. The WAL is rotated through a recoverable renamed generation with directory
+   syncs after a successful flush.
 7. When enough flushed tables accumulate, compaction merges them into one table and atomically replaces the manifest with a compact snapshot.
 8. On restart, manifest-listed SSTables are loaded first, then the WAL is replayed up to the last complete record.
 
@@ -58,6 +59,7 @@ The current database directory looks like this:
 db/
   wal/
     current.log
+    previous.log  # only while rotation is incomplete
   sst/
     000001.sst
   MANIFEST

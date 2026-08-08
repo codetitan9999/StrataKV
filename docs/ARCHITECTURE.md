@@ -27,9 +27,20 @@ The public API is deliberately small. It should remain stable while internals ev
   and injectable failure boundaries
 - `src/db.cc`: coordinates WAL append, optional sync, memtable apply, flush, table loading, and recovery
 
-Current write order is WAL first, memtable second. When the memtable crosses the configured write buffer size, it is written to a numbered SSTable, recorded in the manifest, and then the WAL is rotated.
+Current write order is WAL first, memtable second. Synchronous writes flush the
+stream and sync the WAL file descriptor before acknowledgement. When the
+memtable crosses the configured write buffer size, it is written to a numbered
+SSTable and recorded in the manifest. WAL rotation then closes and renames
+`current.log` to `previous.log`, syncs the WAL directory, creates and syncs a
+new `current.log`, syncs the directory again, and finally removes the retired
+generation with a final directory sync.
 
-WAL replay applies every complete record with a valid checksum. If a crash leaves a partial final header or payload, replay stops at the complete prefix. A full record with a checksum mismatch is treated as corruption.
+WAL replay applies every complete record with a valid checksum. Recovery replays
+`previous.log` before `current.log` when rotation was interrupted; duplicate
+records already present in manifest-installed SSTables are harmless because
+newer sources shadow older ones. If a crash leaves a partial final header or
+payload, replay stops at the complete prefix. A full record with a checksum
+mismatch is treated as corruption.
 
 ### Read Path
 
@@ -146,6 +157,7 @@ Runtime database layout:
 db/
   wal/
     current.log
+    previous.log  # present only across an interrupted rotation
   sst/
     000001.sst
     000002.sst
@@ -160,7 +172,8 @@ Current tests cover:
 
 - Put/Get/Delete semantics
 - Iterator ordering and tombstone hiding
-- WAL replay across reopen, torn-tail recovery, and checksum corruption detection
+- WAL replay across reopen, torn-tail recovery, checksum corruption detection,
+  descriptor sync, and interrupted rotation recovery
 - SSTable round trips, sorted iteration, key ordering validation, and checksum corruption detection
 - Multi-block SSTable boundaries, index corruption, and legacy format compatibility
 - Lazy block I/O, cache hits after file removal, and deferred I/O failures
@@ -172,13 +185,13 @@ Current tests cover:
 - Iterator snapshot lifetime across compaction and deferred obsolete-file cleanup
 - Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
 - Manifest replay, snapshot replacement, post-snapshot appends, invalid metadata rejection, checksum corruption detection, and missing table handling
-- File-sync, rename, and directory-sync ordering plus injected SSTable and
-  manifest installation failures
+- File-sync, rename, and directory-sync ordering plus injected SSTable,
+  manifest, and WAL rotation failures
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
 
 Next test layers should add:
 
-- WAL replay limits for very large records and injected I/O failures
+- WAL replay limits for very large records and injected append/read failures
 - Multi-level compaction correctness with overwritten keys and tombstones
 - Fault injection around file creation, rename, and manifest updates
 
@@ -216,7 +229,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 3: Flush and Recovery
 
-- Add crash-point recovery tests for WAL rotation and directory creation
+- Bound WAL replay allocation and add injected append/read failures
 
 ### Milestone 4: Iterators and Compaction
 
