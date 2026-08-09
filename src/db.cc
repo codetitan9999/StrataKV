@@ -130,7 +130,8 @@ class DBImpl final : public DB {
                              wal_path_.string() + ": " + ec.message());
     }
 
-    wal_ = std::make_unique<WalWriter>(wal_path_, file_system_);
+    wal_ = std::make_unique<WalWriter>(wal_path_, file_system_,
+                                       options_.max_wal_record_size);
     Status wal_status = wal_->Open(/*append=*/true);
     if (!wal_status.ok() || wal_exists) {
       return wal_status;
@@ -313,7 +314,7 @@ class DBImpl final : public DB {
   }
 
   Status Recover(const std::filesystem::path& path) {
-    WalReader reader(path);
+    WalReader reader(path, file_system_, options_.max_wal_record_size);
     return reader.Replay([this](const LogRecord& record) {
       last_sequence_ = std::max(last_sequence_, record.sequence);
       return memtable_.Apply(record);
@@ -511,7 +512,8 @@ class DBImpl final : public DB {
       return rotate_status;
     }
 
-    auto next_wal = std::make_unique<WalWriter>(wal_path_, file_system_);
+    auto next_wal = std::make_unique<WalWriter>(
+        wal_path_, file_system_, options_.max_wal_record_size);
     Status open_status = next_wal->Open(/*append=*/false);
     if (!open_status.ok()) {
       return open_status;

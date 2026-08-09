@@ -1,10 +1,8 @@
 #include "wal.h"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -102,19 +100,18 @@ Status DecodeRecord(std::string_view payload, LogRecord* record) {
 }  // namespace
 
 WalWriter::WalWriter(std::filesystem::path path,
-                     std::shared_ptr<FileSystem> file_system)
-    : path_(std::move(path)), file_system_(std::move(file_system)) {}
+                     std::shared_ptr<FileSystem> file_system,
+                     std::size_t max_record_size)
+    : path_(std::move(path)),
+      file_system_(std::move(file_system)),
+      max_record_size_(max_record_size) {}
 
 WalWriter::~WalWriter() = default;
 
 Status WalWriter::Open(bool append) {
-  const auto mode = std::ios::binary | std::ios::out |
-                    (append ? std::ios::app : std::ios::trunc);
-  stream_.open(path_, mode);
-  if (!stream_) {
-    return Status::IOError("failed to open WAL for writing: " + path_.string());
-  }
-  return Status::OK();
+  Status status = file_system_->OpenWritableFile(path_, append);
+  open_ = status.ok();
+  return status;
 }
 
 Status WalWriter::Append(const LogRecord& record) {
@@ -124,6 +121,9 @@ Status WalWriter::Append(const LogRecord& record) {
   }
 
   const std::string payload = EncodeRecord(record);
+  if (payload.size() > max_record_size_) {
+    return Status::InvalidArgument("WAL record exceeds configured size limit");
+  }
 
   std::string header;
   header.reserve(8);
@@ -131,50 +131,45 @@ Status WalWriter::Append(const LogRecord& record) {
                              static_cast<std::uint32_t>(payload.size()));
   AppendFixed<std::uint32_t>(header, Checksum(payload));
 
-  stream_.write(header.data(), static_cast<std::streamsize>(header.size()));
-  stream_.write(payload.data(), static_cast<std::streamsize>(payload.size()));
-
-  if (!stream_) {
-    return Status::IOError("failed to append WAL record");
+  if (!open_) {
+    return Status::IOError("WAL is not open for writing");
   }
-
-  return Status::OK();
+  header.append(payload);
+  return file_system_->AppendFile(path_, header);
 }
 
 Status WalWriter::Sync() {
-  stream_.flush();
-  if (!stream_) {
-    return Status::IOError("failed to flush WAL");
+  if (!open_) {
+    return Status::IOError("WAL is not open for writing");
   }
   return file_system_->SyncFile(path_);
 }
 
 Status WalWriter::Close() {
-  stream_.close();
-  if (stream_.fail()) {
-    return Status::IOError("failed to close WAL: " + path_.string());
-  }
+  open_ = false;
   return Status::OK();
 }
 
-WalReader::WalReader(std::filesystem::path path) : path_(std::move(path)) {}
+WalReader::WalReader(std::filesystem::path path,
+                     std::shared_ptr<FileSystem> file_system,
+                     std::size_t max_record_size)
+    : path_(std::move(path)),
+      file_system_(std::move(file_system)),
+      max_record_size_(max_record_size) {}
 
 Status WalReader::Replay(
     const std::function<Status(const LogRecord&)>& apply) const {
-  std::ifstream stream(path_, std::ios::binary);
-  if (!stream) {
-    return Status::IOError("failed to open WAL for reading: " + path_.string());
-  }
-
+  std::uint64_t offset = 0;
   while (true) {
-    std::array<char, 8> header{};
-    stream.read(header.data(), static_cast<std::streamsize>(header.size()));
-
-    if (stream.gcount() == 0 && stream.eof()) {
+    std::string header;
+    Status read_status = file_system_->ReadFile(path_, offset, 8, &header);
+    if (!read_status.ok()) {
+      return read_status;
+    }
+    if (header.empty()) {
       return Status::OK();
     }
-
-    if (stream.gcount() != static_cast<std::streamsize>(header.size())) {
+    if (header.size() != 8) {
       // A crash can leave only part of the final WAL record on disk.
       return Status::OK();
     }
@@ -182,13 +177,20 @@ Status WalReader::Replay(
     std::size_t header_offset = 0;
     std::uint32_t payload_size = 0;
     std::uint32_t expected_checksum = 0;
-    const std::string_view header_view(header.data(), header.size());
+    const std::string_view header_view(header);
     ReadFixed(header_view, &header_offset, &payload_size);
     ReadFixed(header_view, &header_offset, &expected_checksum);
 
-    std::string payload(payload_size, '\0');
-    stream.read(payload.data(), static_cast<std::streamsize>(payload.size()));
-    if (stream.gcount() != static_cast<std::streamsize>(payload.size())) {
+    if (payload_size > max_record_size_) {
+      return Status::Corruption("WAL record exceeds configured size limit");
+    }
+    std::string payload;
+    read_status = file_system_->ReadFile(path_, offset + 8, payload_size,
+                                         &payload);
+    if (!read_status.ok()) {
+      return read_status;
+    }
+    if (payload.size() != payload_size) {
       // Replay the complete prefix and ignore a torn final payload.
       return Status::OK();
     }
@@ -207,6 +209,7 @@ Status WalReader::Replay(
     if (!apply_status.ok()) {
       return apply_status;
     }
+    offset += 8 + payload_size;
   }
 }
 

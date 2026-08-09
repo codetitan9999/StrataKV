@@ -82,6 +82,45 @@ class RecordingFileSystem final : public stratakv::FileSystem {
       stratakv::DefaultFileSystem();
 };
 
+class FailingWalIOFileSystem final : public stratakv::FileSystem {
+ public:
+  stratakv::Status SyncFile(const std::filesystem::path& path) override {
+    return delegate_->SyncFile(path);
+  }
+  stratakv::Status Rename(const std::filesystem::path& from,
+                          const std::filesystem::path& to) override {
+    return delegate_->Rename(from, to);
+  }
+  stratakv::Status SyncDirectory(const std::filesystem::path& path) override {
+    return delegate_->SyncDirectory(path);
+  }
+  stratakv::Status Remove(const std::filesystem::path& path) override {
+    return delegate_->Remove(path);
+  }
+  stratakv::Status OpenWritableFile(const std::filesystem::path& path,
+                                    bool append) override {
+    return delegate_->OpenWritableFile(path, append);
+  }
+  stratakv::Status AppendFile(const std::filesystem::path&,
+                              std::string_view) override {
+    return stratakv::Status::IOError("injected WAL append failure");
+  }
+  stratakv::Status ReadFile(const std::filesystem::path& path,
+                            std::uint64_t offset, std::size_t size,
+                            std::string* data) override {
+    if (fail_reads) {
+      return stratakv::Status::IOError("injected WAL read failure");
+    }
+    return delegate_->ReadFile(path, offset, size, data);
+  }
+
+  bool fail_reads = false;
+
+ private:
+  std::shared_ptr<stratakv::FileSystem> delegate_ =
+      stratakv::DefaultFileSystem();
+};
+
 void AppendRecord(TestRunner* runner, const std::filesystem::path& path,
                   const stratakv::LogRecord& record, bool append = true) {
   stratakv::WalWriter writer(path);
@@ -219,6 +258,57 @@ void SyncsWalFile(TestRunner* runner) {
                  "WAL sync should reach the filesystem durability boundary");
 }
 
+void RejectsOversizedRecordsBeforeRecoveryAllocation(TestRunner* runner) {
+  TempDir dir;
+  const auto path = dir.path() / "current.log";
+  std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+  const char header[] = {0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  stream.write(header, sizeof(header));
+  stream.close();
+
+  std::vector<stratakv::LogRecord> records;
+  stratakv::WalReader reader(path, stratakv::DefaultFileSystem(), 128);
+  const stratakv::Status status = reader.Replay(
+      [&](const stratakv::LogRecord& record) {
+        records.push_back(record);
+        return stratakv::Status::OK();
+      });
+  runner->Expect(status.code() == stratakv::Status::Code::kCorruption,
+                 "oversized recovery record should be corruption");
+  runner->Expect(records.empty(), "oversized record should not replay");
+
+  stratakv::WalWriter writer(path, stratakv::DefaultFileSystem(), 20);
+  runner->ExpectOk(writer.Open(/*append=*/false), "open bounded WAL writer");
+  const stratakv::Status write_status = writer.Append(
+      stratakv::LogRecord{stratakv::RecordType::kPut, 1, "key", "value"});
+  runner->Expect(write_status.code() ==
+                     stratakv::Status::Code::kInvalidArgument,
+                 "oversized write should be rejected consistently");
+}
+
+void PropagatesInjectedWalIOFailures(TestRunner* runner) {
+  TempDir dir;
+  const auto path = dir.path() / "current.log";
+  auto file_system = std::make_shared<FailingWalIOFileSystem>();
+  stratakv::WalWriter writer(path, file_system);
+  runner->ExpectOk(writer.Open(/*append=*/false), "open fault-injected WAL");
+  const stratakv::Status append_status = writer.Append(
+      stratakv::LogRecord{stratakv::RecordType::kPut, 1, "alpha", "one"});
+  runner->Expect(append_status.code() == stratakv::Status::Code::kIOError,
+                 "injected append failure should propagate");
+
+  AppendRecord(runner, path,
+               stratakv::LogRecord{stratakv::RecordType::kPut, 1, "alpha",
+                                    "one"},
+               /*append=*/false);
+  file_system->fail_reads = true;
+  stratakv::WalReader reader(path, file_system);
+  const stratakv::Status read_status = reader.Replay(
+      [](const stratakv::LogRecord&) { return stratakv::Status::OK(); });
+  runner->Expect(read_status.code() == stratakv::Status::Code::kIOError,
+                 "injected read failure should propagate");
+}
+
 }  // namespace
 
 int main() {
@@ -228,5 +318,7 @@ int main() {
   IgnoresTornTrailingPayload(&runner);
   DetectsChecksumMismatch(&runner);
   SyncsWalFile(&runner);
+  RejectsOversizedRecordsBeforeRecoveryAllocation(&runner);
+  PropagatesInjectedWalIOFailures(&runner);
   return runner.Finish();
 }

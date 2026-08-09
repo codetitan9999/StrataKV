@@ -31,6 +31,10 @@ struct Options {
   // Durably sync the WAL file after each write.
   bool fsync_wal = false;
 
+  // Maximum encoded WAL record payload accepted for writes and recovery.
+  // Recovery validates this bound before allocating the payload buffer.
+  std::size_t max_wal_record_size = 64 * 1024 * 1024;
+
   // Optional filesystem implementation for durability operations and fault
   // injection. A null pointer selects the platform default.
   std::shared_ptr<FileSystem> file_system;
