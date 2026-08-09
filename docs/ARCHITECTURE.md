@@ -40,7 +40,13 @@ WAL replay applies every complete record with a valid checksum. Recovery replays
 records already present in manifest-installed SSTables are harmless because
 newer sources shadow older ones. If a crash leaves a partial final header or
 payload, replay stops at the complete prefix. A full record with a checksum
-mismatch is treated as corruption.
+mismatch is treated as corruption. The length prefix is checked against
+`Options::max_wal_record_size` before allocating the payload buffer, preventing
+damaged or hostile headers from forcing unbounded recovery allocation. Writers
+apply the same limit so a database cannot produce records it is configured to
+reject later. Descriptor-based WAL append and positional reads are exposed by
+the filesystem interface, allowing deterministic propagation tests for I/O
+failures as well as sync and rename failures.
 
 ### Read Path
 
@@ -191,7 +197,6 @@ Current tests cover:
 
 Next test layers should add:
 
-- WAL replay limits for very large records and injected append/read failures
 - Multi-level compaction correctness with overwritten keys and tombstones
 - Fault injection around file creation, rename, and manifest updates
 
@@ -221,7 +226,8 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 - Add version-set types
 - Add structured logging around open/recovery
-- Extend filesystem fault injection to reads, writes, and WAL operations
+- Extend filesystem fault injection beyond WAL operations to SSTable and
+  manifest reads and writes
 
 ### Milestone 2: SSTable Format
 
@@ -229,7 +235,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 3: Flush and Recovery
 
-- Bound WAL replay allocation and add injected append/read failures
+- Add recovery benchmarks by WAL size and record distribution
 
 ### Milestone 4: Iterators and Compaction
 
