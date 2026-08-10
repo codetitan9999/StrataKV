@@ -84,13 +84,15 @@ class SSTableReader : public std::enable_shared_from_this<SSTableReader> {
   SSTableReader(std::filesystem::path path,
                 std::vector<TableBlockIndexEntry> index,
                 std::vector<TableEntry> legacy_entries,
-                TableMetadata metadata, std::shared_ptr<BlockCache> block_cache);
+                bool compressed_blocks, TableMetadata metadata,
+                std::shared_ptr<BlockCache> block_cache);
   std::pair<std::shared_ptr<const std::vector<TableEntry>>, Status> ReadBlock(
       std::size_t block_index) const;
 
   std::filesystem::path path_;
   std::vector<TableBlockIndexEntry> index_;
   std::vector<TableEntry> legacy_entries_;
+  bool compressed_blocks_ = false;
   TableMetadata metadata_;
   std::shared_ptr<BlockCache> block_cache_;
   bool obsolete_ = false;

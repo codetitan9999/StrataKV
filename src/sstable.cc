@@ -16,7 +16,8 @@
 namespace stratakv {
 namespace {
 
-constexpr std::string_view kMagic = "STKV0002";
+constexpr std::string_view kMagic = "STKV0003";
+constexpr std::string_view kIndexedLegacyMagic = "STKV0002";
 constexpr std::string_view kLegacyMagic = "STKV0001";
 constexpr std::size_t kFooterSize =
     sizeof(std::uint64_t) + sizeof(std::uint64_t) + sizeof(std::uint64_t) +
@@ -24,6 +25,7 @@ constexpr std::size_t kFooterSize =
 constexpr std::size_t kLegacyFooterSize =
     sizeof(std::uint64_t) + sizeof(std::uint64_t) + sizeof(std::uint32_t) + 8;
 constexpr std::size_t kBlockTrailerSize = sizeof(std::uint32_t);
+constexpr std::size_t kRestartInterval = 16;
 
 using BlockIndexEntry = TableBlockIndexEntry;
 
@@ -63,25 +65,29 @@ std::uint32_t Checksum(std::string_view payload) {
   return hash;
 }
 
-Status EncodeEntry(std::string& out, const TableEntry& entry) {
-  const std::string_view key = entry.key;
-  const std::string_view value = entry.value;
-  if (key.size() > std::numeric_limits<std::uint32_t>::max() ||
-      value.size() > std::numeric_limits<std::uint32_t>::max()) {
+std::size_t SharedPrefixLength(std::string_view left, std::string_view right) {
+  const std::size_t limit = std::min(left.size(), right.size());
+  std::size_t shared = 0;
+  while (shared < limit && left[shared] == right[shared]) ++shared;
+  return shared;
+}
+
+Status EncodeCompressedEntry(std::string& out, const TableEntry& entry,
+                             std::string_view previous_key, bool restart) {
+  if (entry.key.size() > std::numeric_limits<std::uint32_t>::max() ||
+      entry.value.size() > std::numeric_limits<std::uint32_t>::max()) {
     return Status::InvalidArgument("SSTable key/value is too large");
   }
-  if (entry.type != RecordType::kPut && entry.type != RecordType::kDelete) {
-    return Status::InvalidArgument("invalid SSTable entry type");
-  }
-  if (entry.type == RecordType::kDelete && !value.empty()) {
-    return Status::InvalidArgument("delete entries must not store values");
-  }
-
+  const std::size_t shared =
+      restart ? 0 : SharedPrefixLength(previous_key, entry.key);
+  const std::size_t suffix = entry.key.size() - shared;
+  AppendFixed<std::uint32_t>(out, static_cast<std::uint32_t>(shared));
+  AppendFixed<std::uint32_t>(out, static_cast<std::uint32_t>(suffix));
+  AppendFixed<std::uint32_t>(out,
+                             static_cast<std::uint32_t>(entry.value.size()));
   AppendFixed<std::uint8_t>(out, static_cast<std::uint8_t>(entry.type));
-  AppendFixed<std::uint32_t>(out, static_cast<std::uint32_t>(key.size()));
-  AppendFixed<std::uint32_t>(out, static_cast<std::uint32_t>(value.size()));
-  out.append(key);
-  out.append(value);
+  out.append(entry.key.data() + shared, suffix);
+  out.append(entry.value);
   return Status::OK();
 }
 
@@ -143,7 +149,7 @@ Status DecodeEntries(std::string_view data_block, std::uint64_t entry_count,
 }
 
 Status DecodeBlock(std::string_view block, std::uint64_t entry_count,
-                   std::vector<TableEntry>* out) {
+                   bool compressed, std::vector<TableEntry>* out) {
   if (block.size() < kBlockTrailerSize) {
     return Status::Corruption("SSTable data block is smaller than trailer");
   }
@@ -156,7 +162,89 @@ Status DecodeBlock(std::string_view block, std::uint64_t entry_count,
   if (Checksum(data) != expected_checksum) {
     return Status::Corruption("SSTable data block checksum mismatch");
   }
-  return DecodeEntries(data, entry_count, out);
+  if (!compressed) return DecodeEntries(data, entry_count, out);
+  if (data.size() < sizeof(std::uint32_t)) {
+    return Status::Corruption("SSTable compressed block lacks restart count");
+  }
+  std::size_t count_offset = data.size() - sizeof(std::uint32_t);
+  std::uint32_t restart_count = 0;
+  if (!ReadFixed(data, &count_offset, &restart_count) || restart_count == 0 ||
+      restart_count !=
+          (entry_count + kRestartInterval - 1) / kRestartInterval) {
+    return Status::Corruption("invalid SSTable restart count");
+  }
+  const std::uint64_t restart_bytes =
+      static_cast<std::uint64_t>(restart_count) * sizeof(std::uint32_t);
+  if (restart_bytes > data.size() - sizeof(std::uint32_t)) {
+    return Status::Corruption("SSTable restart array exceeds data block");
+  }
+  const std::size_t entries_end = data.size() - sizeof(std::uint32_t) -
+                                  static_cast<std::size_t>(restart_bytes);
+  std::vector<std::uint32_t> restarts;
+  restarts.reserve(restart_count);
+  std::size_t restart_offset = entries_end;
+  for (std::uint32_t i = 0; i < restart_count; ++i) {
+    std::uint32_t value = 0;
+    if (!ReadFixed(data, &restart_offset, &value) || value >= entries_end ||
+        (!restarts.empty() && value <= restarts.back())) {
+      return Status::Corruption("invalid SSTable restart offset");
+    }
+    restarts.push_back(value);
+  }
+  if (restarts.front() != 0) {
+    return Status::Corruption("SSTable first restart is not block start");
+  }
+
+  out->clear();
+  out->reserve(static_cast<std::size_t>(entry_count));
+  std::size_t offset = 0;
+  std::size_t next_restart = 0;
+  std::string previous_key;
+  while (offset < entries_end) {
+    const bool at_restart = next_restart < restarts.size() &&
+                            offset == restarts[next_restart];
+    if (next_restart < restarts.size() && offset > restarts[next_restart]) {
+      return Status::Corruption("SSTable restart does not align with entry");
+    }
+    if (at_restart) ++next_restart;
+    if (at_restart != (out->size() % kRestartInterval == 0)) {
+      return Status::Corruption("SSTable restart interval mismatch");
+    }
+    std::uint32_t shared = 0;
+    std::uint32_t suffix = 0;
+    std::uint32_t value_size = 0;
+    std::uint8_t type = 0;
+    if (!ReadFixed(data, &offset, &shared) ||
+        !ReadFixed(data, &offset, &suffix) ||
+        !ReadFixed(data, &offset, &value_size) ||
+        !ReadFixed(data, &offset, &type)) {
+      return Status::Corruption("short compressed SSTable entry header");
+    }
+    if ((at_restart && shared != 0) || shared > previous_key.size() ||
+        static_cast<std::uint64_t>(offset) + suffix + value_size > entries_end) {
+      return Status::Corruption("invalid compressed SSTable entry length");
+    }
+    std::string key = previous_key.substr(0, shared);
+    key.append(data.substr(offset, suffix));
+    offset += suffix;
+    std::string value(data.substr(offset, value_size));
+    offset += value_size;
+    if (key.empty() || (!out->empty() && out->back().key >= key) ||
+        (type != static_cast<std::uint8_t>(RecordType::kPut) &&
+         type != static_cast<std::uint8_t>(RecordType::kDelete)) ||
+        (type == static_cast<std::uint8_t>(RecordType::kDelete) &&
+         !value.empty())) {
+      return Status::Corruption("invalid compressed SSTable entry");
+    }
+    previous_key = key;
+    out->push_back(TableEntry{static_cast<RecordType>(type), std::move(key),
+                              std::move(value)});
+  }
+  if (offset != entries_end || next_restart != restarts.size() ||
+      out->size() != entry_count) {
+    return Status::Corruption("SSTable compressed entry count mismatch");
+  }
+  return Status::OK();
 }
 
 Status DecodeIndex(std::string_view index, std::vector<BlockIndexEntry>* out) {
@@ -379,6 +467,7 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
 
   std::string file;
   std::string data_block;
+  std::vector<std::uint32_t> restart_offsets;
   std::vector<BlockIndexEntry> index_entries;
   std::uint64_t block_entry_count = 0;
   std::size_t entries_written = 0;
@@ -390,6 +479,11 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
     BlockIndexEntry index_entry;
     index_entry.last_key = entries_[entries_written - 1].key;
     index_entry.offset = static_cast<std::uint64_t>(file.size());
+    for (std::uint32_t restart : restart_offsets) {
+      AppendFixed<std::uint32_t>(data_block, restart);
+    }
+    AppendFixed<std::uint32_t>(data_block,
+                               static_cast<std::uint32_t>(restart_offsets.size()));
     index_entry.size =
         static_cast<std::uint64_t>(data_block.size() + kBlockTrailerSize);
     index_entry.entry_count = block_entry_count;
@@ -397,18 +491,33 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
     AppendFixed<std::uint32_t>(file, Checksum(data_block));
     index_entries.push_back(std::move(index_entry));
     data_block.clear();
+    restart_offsets.clear();
     block_entry_count = 0;
   };
 
   for (const auto& entry : entries_) {
     std::string encoded;
-    Status encode_status = EncodeEntry(encoded, entry);
+    const bool restart = block_entry_count % kRestartInterval == 0;
+    Status encode_status = EncodeCompressedEntry(
+        encoded, entry,
+        block_entry_count == 0 ? std::string_view{}
+                               : std::string_view(entries_[entries_written - 1].key),
+        restart);
     if (!encode_status.ok()) {
       return encode_status;
     }
     if (!data_block.empty() &&
-        data_block.size() + encoded.size() > target_block_size_) {
+        data_block.size() + encoded.size() +
+                (restart_offsets.size() + (restart ? 1 : 0) + 1) *
+                    sizeof(std::uint32_t) >
+            target_block_size_) {
       finish_block();
+      encoded.clear();
+      encode_status = EncodeCompressedEntry(encoded, entry, {}, true);
+      if (!encode_status.ok()) return encode_status;
+    }
+    if (block_entry_count % kRestartInterval == 0) {
+      restart_offsets.push_back(static_cast<std::uint32_t>(data_block.size()));
     }
     data_block.append(encoded);
     ++block_entry_count;
@@ -514,11 +623,14 @@ std::pair<std::shared_ptr<SSTableReader>, Status> SSTableReader::Open(
     TableMetadata metadata{0, path, entries.front().key, entries.back().key,
                            count, file_size};
     return {std::shared_ptr<SSTableReader>(new SSTableReader(
-                path, {}, std::move(entries), std::move(metadata),
+                path, {}, std::move(entries), false, std::move(metadata),
                 std::move(block_cache))),
             Status::OK()};
   }
-  if (std::string_view(magic.data(), magic.size()) != kMagic ||
+  const bool compressed_blocks =
+      std::string_view(magic.data(), magic.size()) == kMagic;
+  if ((!compressed_blocks &&
+       std::string_view(magic.data(), magic.size()) != kIndexedLegacyMagic) ||
       file_size < kFooterSize) {
     return {nullptr, Status::Corruption("SSTable footer magic mismatch")};
   }
@@ -569,7 +681,8 @@ std::pair<std::shared_ptr<SSTableReader>, Status> SSTableReader::Open(
   TableMetadata metadata{0, path, {}, index.back().last_key, entry_count,
                          file_size};
   auto reader = std::shared_ptr<SSTableReader>(new SSTableReader(
-      path, std::move(index), {}, std::move(metadata), std::move(block_cache)));
+      path, std::move(index), {}, compressed_blocks, std::move(metadata),
+      std::move(block_cache)));
   auto [first, first_status] = reader->ReadBlock(0);
   if (!first_status.ok()) {
     return {nullptr, first_status};
@@ -684,11 +797,13 @@ void SSTableReader::MarkObsolete() { obsolete_ = true; }
 
 SSTableReader::SSTableReader(
     std::filesystem::path path, std::vector<BlockIndexEntry> index,
-    std::vector<TableEntry> legacy_entries, TableMetadata metadata,
+    std::vector<TableEntry> legacy_entries, bool compressed_blocks,
+    TableMetadata metadata,
     std::shared_ptr<BlockCache> block_cache)
     : path_(std::move(path)),
       index_(std::move(index)),
       legacy_entries_(std::move(legacy_entries)),
+      compressed_blocks_(compressed_blocks),
       metadata_(std::move(metadata)),
       block_cache_(std::move(block_cache)) {}
 
@@ -714,7 +829,8 @@ SSTableReader::ReadBlock(std::size_t block_index) const {
     return {nullptr, Status::IOError("failed to read SSTable block")};
   }
   auto decoded = std::make_shared<std::vector<TableEntry>>();
-  Status status = DecodeBlock(encoded, descriptor.entry_count, decoded.get());
+  Status status = DecodeBlock(encoded, descriptor.entry_count,
+                              compressed_blocks_, decoded.get());
   if (!status.ok()) {
     return {nullptr, status};
   }

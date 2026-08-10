@@ -73,6 +73,26 @@ std::uint32_t Checksum(const std::string& payload) {
   return hash;
 }
 
+std::uint64_t ReadFixed(const std::string& input, std::size_t offset,
+                        std::size_t bytes) {
+  std::uint64_t value = 0;
+  for (std::size_t i = 0; i < bytes; ++i) {
+    value |= static_cast<std::uint64_t>(
+                 static_cast<unsigned char>(input[offset + i]))
+             << (8 * i);
+  }
+  return value;
+}
+
+std::string ReadFile(const std::filesystem::path& path) {
+  std::ifstream stream(path, std::ios::binary | std::ios::ate);
+  const auto size = stream.tellg();
+  std::string contents(static_cast<std::size_t>(size), '\0');
+  stream.seekg(0);
+  stream.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+  return contents;
+}
+
 void AppendLegacyPut(std::string* data, const std::string& key,
                      const std::string& value) {
   AppendFixed(data, 1, 1);
@@ -298,6 +318,128 @@ void ReadsLegacySingleBlockTable(TestRunner* runner) {
                  "legacy table metadata");
 }
 
+void WritesGoldenPrefixCompressedBlock(TestRunner* runner) {
+  TempDir dir;
+  const auto table_path = dir.path() / "000001.sst";
+  stratakv::SSTableBuilder builder(table_path, 4096);
+  runner->ExpectOk(builder.Add("alpine", "one"), "add golden first key");
+  runner->ExpectOk(builder.Add("alps", "two"), "add golden second key");
+  stratakv::TableMetadata metadata;
+  runner->ExpectOk(builder.Finish(&metadata), "finish golden table");
+
+  std::string data;
+  AppendFixed(&data, 0, 4);
+  AppendFixed(&data, 6, 4);
+  AppendFixed(&data, 3, 4);
+  AppendFixed(&data, 1, 1);
+  data.append("alpineone");
+  AppendFixed(&data, 3, 4);
+  AppendFixed(&data, 1, 4);
+  AppendFixed(&data, 3, 4);
+  AppendFixed(&data, 1, 1);
+  data.append("stwo");
+  AppendFixed(&data, 0, 4);
+  AppendFixed(&data, 1, 4);
+
+  std::string expected = data;
+  AppendFixed(&expected, Checksum(data), 4);
+  const std::uint64_t index_offset = expected.size();
+  std::string index;
+  AppendFixed(&index, 4, 4);
+  index.append("alps");
+  AppendFixed(&index, 0, 8);
+  AppendFixed(&index, index_offset, 8);
+  AppendFixed(&index, 2, 8);
+  expected.append(index);
+  AppendFixed(&expected, 2, 8);
+  AppendFixed(&expected, index_offset, 8);
+  AppendFixed(&expected, index.size(), 8);
+  AppendFixed(&expected, Checksum(index), 4);
+  expected.append("STKV0003");
+
+  runner->Expect(ReadFile(table_path) == expected,
+                 "prefix-compressed encoding matches golden bytes");
+}
+
+void DetectsCorruptRestartArray(TestRunner* runner) {
+  TempDir dir;
+  const auto table_path = dir.path() / "000001.sst";
+  stratakv::SSTableBuilder builder(table_path);
+  runner->ExpectOk(builder.Add("prefix-000", "one"), "add restart key");
+  runner->ExpectOk(builder.Add("prefix-001", "two"), "add compressed key");
+  stratakv::TableMetadata metadata;
+  runner->ExpectOk(builder.Finish(&metadata), "finish restart table");
+
+  std::string file = ReadFile(table_path);
+  constexpr std::size_t kFooterSize = 36;
+  const std::size_t index_offset = static_cast<std::size_t>(
+      ReadFixed(file, file.size() - kFooterSize + 8, 8));
+  const std::size_t restart_offset = index_offset - 4 - 4 - 4;
+  file[restart_offset] = 1;
+  const std::string data = file.substr(0, index_offset - 4);
+  const std::uint32_t checksum = Checksum(data);
+  for (std::size_t i = 0; i < 4; ++i) {
+    file[index_offset - 4 + i] =
+        static_cast<char>((checksum >> (8 * i)) & 0xffU);
+  }
+  std::ofstream stream(table_path, std::ios::binary | std::ios::trunc);
+  stream.write(file.data(), static_cast<std::streamsize>(file.size()));
+  stream.close();
+
+  auto [reader, status] = stratakv::SSTableReader::Open(table_path);
+  (void)reader;
+  runner->Expect(status.code() == stratakv::Status::Code::kCorruption,
+                 "misaligned restart array is rejected after checksum");
+}
+
+void ReadsLegacyIndexedTable(TestRunner* runner) {
+  TempDir dir;
+  const auto table_path = dir.path() / "000001.sst";
+  std::string data;
+  AppendLegacyPut(&data, "alpha", "one");
+  AppendLegacyPut(&data, "beta", "two");
+  std::string file = data;
+  AppendFixed(&file, Checksum(data), 4);
+  const std::uint64_t index_offset = file.size();
+  std::string index;
+  AppendFixed(&index, 4, 4);
+  index.append("beta");
+  AppendFixed(&index, 0, 8);
+  AppendFixed(&index, index_offset, 8);
+  AppendFixed(&index, 2, 8);
+  file.append(index);
+  AppendFixed(&file, 2, 8);
+  AppendFixed(&file, index_offset, 8);
+  AppendFixed(&file, index.size(), 8);
+  AppendFixed(&file, Checksum(index), 4);
+  file.append("STKV0002");
+  std::ofstream stream(table_path, std::ios::binary);
+  stream.write(file.data(), static_cast<std::streamsize>(file.size()));
+  stream.close();
+
+  auto [reader, status] = stratakv::SSTableReader::Open(table_path);
+  runner->ExpectOk(status, "open legacy indexed table");
+  if (!reader) return;
+  auto [value, get_status] = reader->Get("beta");
+  runner->ExpectOk(get_status, "read legacy indexed value");
+  runner->Expect(value == "two", "legacy indexed table value");
+}
+
+void CompressesSharedKeyPrefixes(TestRunner* runner) {
+  TempDir dir;
+  stratakv::SSTableBuilder builder(dir.path() / "000001.sst", 1 << 20);
+  std::size_t uncompressed_entries_size = 0;
+  for (int i = 1000; i < 1100; ++i) {
+    const std::string key = "customer/account/region/" + std::to_string(i);
+    runner->ExpectOk(builder.Add(key, "value"), "add compressible key");
+    uncompressed_entries_size += 9 + key.size() + 5;
+  }
+  stratakv::TableMetadata metadata;
+  runner->ExpectOk(builder.Finish(&metadata), "finish compressible table");
+  runner->Expect(metadata.file_size_bytes < uncompressed_entries_size,
+                 "prefix compression reduces total table bytes");
+}
+
 void LazilyReadsAndCachesDataBlocks(TestRunner* runner) {
   TempDir dir;
   const auto table_path = dir.path() / "000001.sst";
@@ -364,6 +506,10 @@ int main() {
   ReadsAcrossMultipleBlocks(&runner);
   DetectsCorruptIndexBlock(&runner);
   ReadsLegacySingleBlockTable(&runner);
+  WritesGoldenPrefixCompressedBlock(&runner);
+  DetectsCorruptRestartArray(&runner);
+  ReadsLegacyIndexedTable(&runner);
+  CompressesSharedKeyPrefixes(&runner);
   LazilyReadsAndCachesDataBlocks(&runner);
   EnforcesSharedCacheBudget(&runner);
   return runner.Finish();
