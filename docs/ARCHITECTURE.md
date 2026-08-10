@@ -83,12 +83,18 @@ sorted entries into target-sized data blocks. Each data block has its own
 checksum, and an index maps each block's largest key to its byte range:
 
 ```text
-data block 0: repeated sorted key/value entries, checksum
-data block 1: repeated sorted key/value entries, checksum
+data block 0: prefix-compressed sorted entries, restart array, checksum
+data block 1: prefix-compressed sorted entries, restart array, checksum
 ...
 index block: largest key, block offset, block size, entry count
 footer: total entry count, index location, index checksum, format magic
 ```
+
+Within each data block, keys store the byte prefix shared with the previous key
+plus an unshared suffix. Every sixteenth entry stores its full key and is listed
+in a trailing restart array. Restart offsets and intervals are validated during
+decode, bounding reconstruction chains and making malformed offsets explicit
+corruption.
 
 The reader loads and verifies only the footer, index, and first data block at
 open. Point lookups binary-search the index and read the selected data block on
@@ -100,9 +106,9 @@ and capacity for diagnostics and benchmarks; checksum, ordering, and
 index-boundary failures
 found during lazy reads are returned to the caller. Full scans validate blocks
 as they traverse them. Readers retain
-compatibility with the original single-block `STKV0001` format, while new
-tables use the indexed `STKV0002` format. Prefix compression remains future
-work.
+compatibility with the original single-block `STKV0001` and uncompressed
+indexed `STKV0002` formats, while new tables use the prefix-compressed
+`STKV0003` format.
 
 ### Compaction
 
@@ -182,6 +188,8 @@ Current tests cover:
   descriptor sync, and interrupted rotation recovery
 - SSTable round trips, sorted iteration, key ordering validation, and checksum corruption detection
 - Multi-block SSTable boundaries, index corruption, and legacy format compatibility
+- Golden prefix-compressed block encoding, restart-array corruption, and
+  compression effectiveness for shared key prefixes
 - Lazy block I/O, cache hits after file removal, and deferred I/O failures
 - Shared-cache reuse across readers and cache hit/miss accounting
 - Streaming iterator seek, version selection, tombstone hiding, and deferred
@@ -208,7 +216,8 @@ The current benchmark measures local `Put` performance with automatic
 compaction disabled to retain many scan sources, then reopens the database
 and runs cold and warm random `Get` passes plus full and bounded streaming scans
 against flushed SSTables and the final WAL tail. It reports throughput, latency
-percentiles, and shared block-cache hits, misses, evictions, and usage.
+percentiles, SSTable bytes, and shared block-cache hits, misses, evictions, and
+usage.
 
 Future benchmark tracks:
 
@@ -231,7 +240,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 2: SSTable Format
 
-- Add prefix compression and golden encoding tests
+- Add block-level point lookup without fully decoding the selected block
 
 ### Milestone 3: Flush and Recovery
 

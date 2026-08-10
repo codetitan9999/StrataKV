@@ -13,7 +13,8 @@ The API is small on purpose. The interesting part is inside the engine: how data
   bounded recovery allocation
 - Delete tombstones
 - WAL replay on reopen, including torn-tail recovery
-- Multi-block SSTables with per-block checksums and an on-disk index
+- Prefix-compressed multi-block SSTables with restart points, per-block
+  checksums, and an on-disk index
 - Lazy SSTable block reads with a database-wide bounded LRU cache and metrics
 - Heap-merged streaming range and prefix scans across the memtable and SSTables
 - Iterator snapshots that remain readable across compaction cleanup
@@ -87,7 +88,7 @@ docs/               architecture notes
 
 ### Phase 1: Storage Engine
 
-- Prefix-compressed SSTable blocks
+- Overlap-aware leveled compaction
 - More recovery and corruption tests
 - Benchmarks for writes, reads, scans, recovery, and compaction
 
