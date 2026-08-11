@@ -88,6 +88,8 @@ class SSTableReader : public std::enable_shared_from_this<SSTableReader> {
                 std::shared_ptr<BlockCache> block_cache);
   std::pair<std::shared_ptr<const std::vector<TableEntry>>, Status> ReadBlock(
       std::size_t block_index) const;
+  std::pair<std::shared_ptr<const std::string>, Status> ReadEncodedBlock(
+      std::size_t block_index) const;
 
   std::filesystem::path path_;
   std::vector<TableBlockIndexEntry> index_;

@@ -6,9 +6,6 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <vector>
-
-#include "record.h"
 #include "stratakv/block_cache.h"
 
 namespace stratakv {
@@ -16,13 +13,13 @@ namespace stratakv {
 class BlockCache {
  public:
   explicit BlockCache(std::size_t capacity_bytes);
-  std::shared_ptr<const std::vector<TableEntry>> Lookup(
+  std::shared_ptr<const std::string> Lookup(
       const std::filesystem::path& path, std::uint64_t offset,
       std::uint64_t size);
-  std::shared_ptr<const std::vector<TableEntry>> Insert(
+  std::shared_ptr<const std::string> Insert(
       const std::filesystem::path& path, std::uint64_t offset,
       std::uint64_t size,
-      std::shared_ptr<const std::vector<TableEntry>> entries);
+      std::shared_ptr<const std::string> block);
   [[nodiscard]] BlockCacheStats stats() const;
 
  private:
@@ -34,7 +31,7 @@ class BlockCache {
   };
   struct KeyHash { std::size_t operator()(const Key& key) const; };
   struct Entry {
-    std::shared_ptr<const std::vector<TableEntry>> entries;
+    std::shared_ptr<const std::string> block;
     std::size_t charge = 0;
     std::list<Key>::iterator lru_position;
   };

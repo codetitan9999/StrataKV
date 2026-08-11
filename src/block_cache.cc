@@ -22,7 +22,7 @@ BlockCache::Key BlockCache::MakeKey(const std::filesystem::path& path,
   return Key{path.lexically_normal().string(), offset, size};
 }
 
-std::shared_ptr<const std::vector<TableEntry>> BlockCache::Lookup(
+std::shared_ptr<const std::string> BlockCache::Lookup(
     const std::filesystem::path& path, std::uint64_t offset,
     std::uint64_t size) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -33,20 +33,20 @@ std::shared_ptr<const std::vector<TableEntry>> BlockCache::Lookup(
   }
   ++hits_;
   lru_.splice(lru_.begin(), lru_, found->second.lru_position);
-  return found->second.entries;
+  return found->second.block;
 }
 
-std::shared_ptr<const std::vector<TableEntry>> BlockCache::Insert(
+std::shared_ptr<const std::string> BlockCache::Insert(
     const std::filesystem::path& path, std::uint64_t offset,
     std::uint64_t size,
-    std::shared_ptr<const std::vector<TableEntry>> entries) {
-  if (capacity_bytes_ == 0 || size > capacity_bytes_) return entries;
+    std::shared_ptr<const std::string> block) {
+  if (capacity_bytes_ == 0 || size > capacity_bytes_) return block;
   const Key key = MakeKey(path, offset, size);
   std::lock_guard<std::mutex> lock(mutex_);
   const auto existing = entries_.find(key);
   if (existing != entries_.end()) {
     lru_.splice(lru_.begin(), lru_, existing->second.lru_position);
-    return existing->second.entries;
+    return existing->second.block;
   }
   while (!lru_.empty() && usage_bytes_ + size > capacity_bytes_) {
     const Key& victim = lru_.back();
@@ -56,10 +56,10 @@ std::shared_ptr<const std::vector<TableEntry>> BlockCache::Insert(
     ++evictions_;
   }
   lru_.push_front(key);
-  entries_.emplace(key, Entry{entries, static_cast<std::size_t>(size),
+  entries_.emplace(key, Entry{block, static_cast<std::size_t>(size),
                               lru_.begin()});
   usage_bytes_ += static_cast<std::size_t>(size);
-  return entries;
+  return block;
 }
 
 BlockCacheStats BlockCache::stats() const {

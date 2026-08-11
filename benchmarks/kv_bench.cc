@@ -168,6 +168,7 @@ int main(int argc, char** argv) {
   std::cout << "path: " << db_path << '\n';
   std::cout << "operations: " << operations << '\n';
   std::cout << "read source: reopened SSTables + final WAL tail\n";
+  std::cout << "SSTable point path: restart-indexed encoded blocks\n";
   std::cout << "scan merge sources: " << CountSSTables(db_path) + 1 << '\n';
   std::cout << "SSTable bytes: " << SSTableBytes(db_path) << '\n';
   std::cout << "shared block cache: " << options.block_cache_size << " bytes\n";

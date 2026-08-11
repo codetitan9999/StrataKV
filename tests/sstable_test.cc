@@ -440,6 +440,95 @@ void CompressesSharedKeyPrefixes(TestRunner* runner) {
                  "prefix compression reduces total table bytes");
 }
 
+void UsesRestartIndexForPointLookups(TestRunner* runner) {
+  TempDir dir;
+  const auto table_path = dir.path() / "000001.sst";
+  stratakv::SSTableBuilder builder(table_path, 4096);
+  for (int i = 0; i < 80; ++i) {
+    const std::string key = "tenant/orders/2026/" + std::to_string(1000 + i);
+    if (i == 47) {
+      runner->ExpectOk(builder.AddDeletion(key), "add restart lookup tombstone");
+    } else {
+      runner->ExpectOk(builder.Add(key, "value-" + std::to_string(i)),
+                       "add restart lookup value");
+    }
+  }
+  stratakv::TableMetadata metadata;
+  runner->ExpectOk(builder.Finish(&metadata), "finish restart lookup table");
+  auto [reader, status] = stratakv::SSTableReader::Open(table_path);
+  runner->ExpectOk(status, "open restart lookup table");
+  if (!reader) return;
+
+  for (int i : {0, 15, 16, 31, 32, 46, 48, 63, 64, 79}) {
+    auto [value, get_status] =
+        reader->Get("tenant/orders/2026/" + std::to_string(1000 + i));
+    runner->ExpectOk(get_status, "lookup across restart boundaries");
+    runner->Expect(value == "value-" + std::to_string(i),
+                   "restart lookup returns exact value");
+  }
+  const auto deleted = reader->Lookup("tenant/orders/2026/1047");
+  runner->Expect(deleted.status.ok() && deleted.found && deleted.deleted,
+                 "restart lookup returns tombstone");
+  runner->Expect(!reader->Lookup("tenant/orders/2026/10315").found,
+                 "restart lookup rejects key between entries");
+}
+
+void DetectsCorruptionInSearchedRestartKey(TestRunner* runner) {
+  TempDir dir;
+  const auto table_path = dir.path() / "000001.sst";
+  stratakv::SSTableBuilder builder(table_path, 512);
+  for (int i = 0; i < 96; ++i) {
+    runner->ExpectOk(builder.Add("key-" + std::to_string(1000 + i), "value"),
+                     "add restart corruption value");
+  }
+  stratakv::TableMetadata metadata;
+  runner->ExpectOk(builder.Finish(&metadata), "finish restart corruption table");
+  auto [reader, open_status] = stratakv::SSTableReader::Open(table_path);
+  runner->ExpectOk(open_status, "open restart corruption table");
+  if (!reader) return;
+
+  std::string file = ReadFile(table_path);
+  constexpr std::size_t kFooterSize = 36;
+  const std::size_t index_offset = static_cast<std::size_t>(
+      ReadFixed(file, file.size() - kFooterSize + 8, 8));
+  std::size_t index_cursor = index_offset;
+  const std::size_t first_key_size =
+      static_cast<std::size_t>(ReadFixed(file, index_cursor, 4));
+  index_cursor += 4 + first_key_size + 8 + 8 + 8;
+  const std::size_t second_key_size =
+      static_cast<std::size_t>(ReadFixed(file, index_cursor, 4));
+  const std::string lookup_key = file.substr(index_cursor + 4, second_key_size);
+  index_cursor += 4 + second_key_size;
+  const std::size_t block_offset =
+      static_cast<std::size_t>(ReadFixed(file, index_cursor, 8));
+  const std::size_t block_size =
+      static_cast<std::size_t>(ReadFixed(file, index_cursor + 8, 8));
+  const std::size_t data_end = block_offset + block_size - 4;
+  const std::size_t restart_count =
+      static_cast<std::size_t>(ReadFixed(file, data_end - 4, 4));
+  const std::size_t restart_array = data_end - 4 - restart_count * 4;
+  runner->Expect(restart_count >= 2,
+                 "second block contains multiple restart points");
+  if (restart_count < 2) return;
+  const std::size_t corrupt_restart = block_offset +
+      static_cast<std::size_t>(ReadFixed(file, restart_array + 4, 4));
+  file[corrupt_restart] = 1;  // Restart entries must have zero shared bytes.
+  const std::string block_data =
+      file.substr(block_offset, block_size - sizeof(std::uint32_t));
+  const std::uint32_t checksum = Checksum(block_data);
+  for (std::size_t i = 0; i < 4; ++i) {
+    file[block_offset + block_size - 4 + i] =
+        static_cast<char>((checksum >> (8 * i)) & 0xffU);
+  }
+  std::ofstream stream(table_path, std::ios::binary | std::ios::trunc);
+  stream.write(file.data(), static_cast<std::streamsize>(file.size()));
+  stream.close();
+
+  const auto lookup = reader->Lookup(lookup_key);
+  runner->Expect(lookup.status.code() == stratakv::Status::Code::kCorruption,
+                 "point lookup validates searched restart keys");
+}
+
 void LazilyReadsAndCachesDataBlocks(TestRunner* runner) {
   TempDir dir;
   const auto table_path = dir.path() / "000001.sst";
@@ -482,8 +571,8 @@ void LazilyReadsAndCachesDataBlocks(TestRunner* runner) {
 
 void EnforcesSharedCacheBudget(TestRunner* runner) {
   stratakv::BlockCache cache(64);
-  auto first = std::make_shared<const std::vector<stratakv::TableEntry>>();
-  auto second = std::make_shared<const std::vector<stratakv::TableEntry>>();
+  auto first = std::make_shared<const std::string>(40, 'a');
+  auto second = std::make_shared<const std::string>(40, 'b');
   cache.Insert("000001.sst", 0, 40, first);
   cache.Insert("000002.sst", 0, 40, second);
   const auto stats = cache.stats();
@@ -510,6 +599,8 @@ int main() {
   DetectsCorruptRestartArray(&runner);
   ReadsLegacyIndexedTable(&runner);
   CompressesSharedKeyPrefixes(&runner);
+  UsesRestartIndexForPointLookups(&runner);
+  DetectsCorruptionInSearchedRestartKey(&runner);
   LazilyReadsAndCachesDataBlocks(&runner);
   EnforcesSharedCacheBudget(&runner);
   return runner.Finish();
