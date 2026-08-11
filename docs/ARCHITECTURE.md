@@ -97,15 +97,19 @@ decode, bounding reconstruction chains and making malformed offsets explicit
 corruption.
 
 The reader loads and verifies only the footer, index, and first data block at
-open. Point lookups binary-search the index and read the selected data block on
-demand. Decoded blocks are retained in a database-wide LRU cache keyed by
-table path and block byte range. `Options::block_cache_size` is a single memory
-budget shared by every open table, preventing memory use from scaling with the
-SSTable count. `DB::GetBlockCacheStats` reports hits, misses, evictions, usage,
-and capacity for diagnostics and benchmarks; checksum, ordering, and
-index-boundary failures
-found during lazy reads are returned to the caller. Full scans validate blocks
-as they traverse them. Readers retain
+open. Point lookups binary-search the block index, then binary-search the
+selected block's restart keys and reconstruct at most one 16-entry prefix
+chain. They do not materialize every entry in the block. Encoded blocks are
+retained in a database-wide LRU cache keyed by table path and byte range;
+iterators decode a cached block only while traversing it. This keeps cache
+charges tied to on-disk bytes and lets point reads reuse cached I/O without
+paying full-block key reconstruction. `Options::block_cache_size` is a single
+memory budget shared by every open table, preventing memory use from scaling
+with the SSTable count. `DB::GetBlockCacheStats` reports hits, misses,
+evictions, usage, and capacity for diagnostics and benchmarks; checksum,
+restart, ordering, and index-boundary failures found during lazy reads are
+returned to the caller. Full scans validate blocks as they traverse them.
+Readers retain
 compatibility with the original single-block `STKV0001` and uncompressed
 indexed `STKV0002` formats, while new tables use the prefix-compressed
 `STKV0003` format.
@@ -190,6 +194,8 @@ Current tests cover:
 - Multi-block SSTable boundaries, index corruption, and legacy format compatibility
 - Golden prefix-compressed block encoding, restart-array corruption, and
   compression effectiveness for shared key prefixes
+- Point lookups across restart boundaries and corruption in searched restart
+  keys
 - Lazy block I/O, cache hits after file removal, and deferred I/O failures
 - Shared-cache reuse across readers and cache hit/miss accounting
 - Streaming iterator seek, version selection, tombstone hiding, and deferred
@@ -240,7 +246,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 2: SSTable Format
 
-- Add block-level point lookup without fully decoding the selected block
+- Add optional Bloom filters to avoid data-block reads for absent keys
 
 ### Milestone 3: Flush and Recovery
 
