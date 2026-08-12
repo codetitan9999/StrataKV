@@ -87,6 +87,7 @@ data block 0: prefix-compressed sorted entries, restart array, checksum
 data block 1: prefix-compressed sorted entries, restart array, checksum
 ...
 index block: largest key, block offset, block size, entry count
+filter block: version, probe count, bit count, Bloom filter bits
 footer: total entry count, index location, index checksum, format magic
 ```
 
@@ -96,10 +97,15 @@ in a trailing restart array. Restart offsets and intervals are validated during
 decode, bounding reconstruction chains and making malformed offsets explicit
 corruption.
 
-The reader loads and verifies only the footer, index, and first data block at
-open. Point lookups binary-search the block index, then binary-search the
-selected block's restart keys and reconstruct at most one 16-entry prefix
-chain. They do not materialize every entry in the block. Encoded blocks are
+The reader loads and verifies only the footer, index, checksummed Bloom filter,
+and first data block at open. A negative Bloom result returns an absent lookup
+without reading a data block. Possible Bloom false positives continue through
+the exact lookup path, so they cannot affect correctness. The filter block
+stores its encoding version, probe count, and bit count; new tables allocate
+ten bits per key and use seven probes. Point lookups that may be present
+binary-search the block index, then binary-search the selected block's restart
+keys and reconstruct at most one 16-entry prefix chain. They do not materialize
+every entry in the block. Encoded blocks are
 retained in a database-wide LRU cache keyed by table path and byte range;
 iterators decode a cached block only while traversing it. This keeps cache
 charges tied to on-disk bytes and lets point reads reuse cached I/O without
@@ -110,9 +116,9 @@ evictions, usage, and capacity for diagnostics and benchmarks; checksum,
 restart, ordering, and index-boundary failures found during lazy reads are
 returned to the caller. Full scans validate blocks as they traverse them.
 Readers retain
-compatibility with the original single-block `STKV0001` and uncompressed
-indexed `STKV0002` formats, while new tables use the prefix-compressed
-`STKV0003` format.
+compatibility with the original single-block `STKV0001`, uncompressed indexed
+`STKV0002`, and prefix-compressed `STKV0003` formats. New tables use the
+Bloom-filtered `STKV0004` format.
 
 ### Compaction
 
@@ -196,6 +202,8 @@ Current tests cover:
   compression effectiveness for shared key prefixes
 - Point lookups across restart boundaries and corruption in searched restart
   keys
+- Bloom-filter negative lookups, present-key safety, and filter checksum
+  corruption
 - Lazy block I/O, cache hits after file removal, and deferred I/O failures
 - Shared-cache reuse across readers and cache hit/miss accounting
 - Streaming iterator seek, version selection, tombstone hiding, and deferred
@@ -220,10 +228,10 @@ The project starts with a tiny local harness to avoid dependency friction. Once 
 
 The current benchmark measures local `Put` performance with automatic
 compaction disabled to retain many scan sources, then reopens the database
-and runs cold and warm random `Get` passes plus full and bounded streaming scans
-against flushed SSTables and the final WAL tail. It reports throughput, latency
-percentiles, SSTable bytes, and shared block-cache hits, misses, evictions, and
-usage.
+and runs cold and warm random `Get` passes, an absent-key pass, plus full and
+bounded streaming scans against flushed SSTables and the final WAL tail. It
+reports throughput, latency percentiles, negative-pass block misses, SSTable
+bytes, and shared block-cache hits, misses, evictions, and usage.
 
 Future benchmark tracks:
 
@@ -246,7 +254,8 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 2: SSTable Format
 
-- Add optional Bloom filters to avoid data-block reads for absent keys
+- Add partitioned filters for very large tables if whole-table filters become
+  a measurable open-time or memory cost
 
 ### Milestone 3: Flush and Recovery
 

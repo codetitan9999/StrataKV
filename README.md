@@ -15,8 +15,8 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - WAL replay on reopen, including torn-tail recovery
 - Prefix-compressed multi-block SSTables with restart points, per-block
   checksums, and an on-disk index
-- Restart-indexed SSTable point reads with a database-wide encoded-block LRU
-  cache and metrics
+- Bloom-filtered, restart-indexed SSTable point reads with a database-wide
+  encoded-block LRU cache and metrics
 - Heap-merged streaming range and prefix scans across the memtable and SSTables
 - Iterator snapshots that remain readable across compaction cleanup
 - Memtable flush to SSTables with WAL rotation
