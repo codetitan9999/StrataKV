@@ -125,6 +125,18 @@ int main(int argc, char** argv) {
   if (cold_duration == Clock::duration::zero() ||
       warm_duration == Clock::duration::zero()) return 1;
 
+  const auto negative_start = Clock::now();
+  for (std::size_t index : order) {
+    auto [value, status] =
+        db->Get(stratakv::ReadOptions{}, KeyFor(index) + "-missing");
+    if (status.code() != stratakv::Status::Code::kNotFound || !value.empty()) {
+      std::cerr << "negative get failed: " << status << '\n';
+      return 1;
+    }
+  }
+  const auto negative_duration = Clock::now() - negative_start;
+  const auto negative_stats = db->GetBlockCacheStats();
+
   std::size_t scanned = 0;
   const auto scan_start = Clock::now();
   auto iterator = db->NewIterator(stratakv::ReadOptions{});
@@ -168,7 +180,7 @@ int main(int argc, char** argv) {
   std::cout << "path: " << db_path << '\n';
   std::cout << "operations: " << operations << '\n';
   std::cout << "read source: reopened SSTables + final WAL tail\n";
-  std::cout << "SSTable point path: restart-indexed encoded blocks\n";
+  std::cout << "SSTable point path: Bloom-filtered restart-indexed blocks\n";
   std::cout << "scan merge sources: " << CountSSTables(db_path) + 1 << '\n';
   std::cout << "SSTable bytes: " << SSTableBytes(db_path) << '\n';
   std::cout << "shared block cache: " << options.block_cache_size << " bytes\n";
@@ -186,6 +198,10 @@ int main(int argc, char** argv) {
             << percentile(warm_latencies_us, 0.50) << "/"
             << percentile(warm_latencies_us, 0.95) << "/"
             << percentile(warm_latencies_us, 0.99) << " us\n";
+  std::cout << "negative get throughput: "
+            << operations / Seconds(negative_duration) << " ops/sec\n";
+  std::cout << "negative-pass cache misses: "
+            << negative_stats.misses - warm_stats.misses << '\n';
   std::cout << "full scan throughput: "
             << scanned / Seconds(scan_duration) << " entries/sec\n";
   std::cout << "bounded scan throughput (" << range_scanned << " entries): "

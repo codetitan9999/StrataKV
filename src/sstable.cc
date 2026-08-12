@@ -16,16 +16,22 @@
 namespace stratakv {
 namespace {
 
-constexpr std::string_view kMagic = "STKV0003";
+constexpr std::string_view kMagic = "STKV0004";
+constexpr std::string_view kCompressedLegacyMagic = "STKV0003";
 constexpr std::string_view kIndexedLegacyMagic = "STKV0002";
 constexpr std::string_view kLegacyMagic = "STKV0001";
 constexpr std::size_t kFooterSize =
     sizeof(std::uint64_t) + sizeof(std::uint64_t) + sizeof(std::uint64_t) +
     sizeof(std::uint32_t) + 8;
+constexpr std::size_t kFilterFooterSize =
+    sizeof(std::uint64_t) * 5 + sizeof(std::uint32_t) * 2 + 8;
 constexpr std::size_t kLegacyFooterSize =
     sizeof(std::uint64_t) + sizeof(std::uint64_t) + sizeof(std::uint32_t) + 8;
 constexpr std::size_t kBlockTrailerSize = sizeof(std::uint32_t);
 constexpr std::size_t kRestartInterval = 16;
+constexpr std::uint32_t kBloomBitsPerKey = 10;
+constexpr std::uint32_t kBloomProbes = 7;
+constexpr std::uint32_t kBloomFilterVersion = 1;
 
 using BlockIndexEntry = TableBlockIndexEntry;
 
@@ -63,6 +69,48 @@ std::uint32_t Checksum(std::string_view payload) {
     hash *= 16777619u;
   }
   return hash;
+}
+
+std::uint32_t BloomHash(std::string_view key) {
+  return Checksum(key);
+}
+
+std::string BuildBloomFilter(const std::vector<TableEntry>& entries) {
+  std::uint64_t bit_count =
+      std::max<std::uint64_t>(64, entries.size() * kBloomBitsPerKey);
+  bit_count = (bit_count + 7) & ~std::uint64_t{7};
+  std::string bits(static_cast<std::size_t>(bit_count / 8), '\0');
+  for (const auto& entry : entries) {
+    std::uint32_t hash = BloomHash(entry.key);
+    const std::uint32_t delta = (hash >> 17) | (hash << 15);
+    for (std::uint32_t probe = 0; probe < kBloomProbes; ++probe) {
+      const std::uint64_t bit = hash % bit_count;
+      bits[static_cast<std::size_t>(bit / 8)] |=
+          static_cast<char>(1U << (bit % 8));
+      hash += delta;
+    }
+  }
+  std::string filter;
+  AppendFixed<std::uint32_t>(filter, kBloomFilterVersion);
+  AppendFixed<std::uint32_t>(filter, kBloomProbes);
+  AppendFixed<std::uint64_t>(filter, bit_count);
+  filter.append(bits);
+  return filter;
+}
+
+bool BloomMayContain(std::string_view filter, std::uint64_t bit_count,
+                     std::uint32_t probes, std::string_view key) {
+  std::uint32_t hash = BloomHash(key);
+  const std::uint32_t delta = (hash >> 17) | (hash << 15);
+  for (std::uint32_t probe = 0; probe < probes; ++probe) {
+    const std::uint64_t bit = hash % bit_count;
+    if ((static_cast<unsigned char>(filter[static_cast<std::size_t>(bit / 8)]) &
+         (1U << (bit % 8))) == 0) {
+      return false;
+    }
+    hash += delta;
+  }
+  return true;
 }
 
 std::size_t SharedPrefixLength(std::string_view left, std::string_view right) {
@@ -680,14 +728,20 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
     AppendFixed<std::uint64_t>(index_block, entry.entry_count);
   }
   file.append(index_block);
+  const std::uint64_t filter_offset = static_cast<std::uint64_t>(file.size());
+  const std::string filter = BuildBloomFilter(entries_);
+  file.append(filter);
   std::string footer;
-  footer.reserve(kFooterSize);
+  footer.reserve(kFilterFooterSize);
   AppendFixed<std::uint64_t>(footer,
                              static_cast<std::uint64_t>(entries_.size()));
   AppendFixed<std::uint64_t>(footer, index_offset);
   AppendFixed<std::uint64_t>(footer,
                              static_cast<std::uint64_t>(index_block.size()));
   AppendFixed<std::uint32_t>(footer, Checksum(index_block));
+  AppendFixed<std::uint64_t>(footer, filter_offset);
+  AppendFixed<std::uint64_t>(footer, static_cast<std::uint64_t>(filter.size()));
+  AppendFixed<std::uint32_t>(footer, Checksum(filter));
   footer.append(kMagic);
 
   std::ofstream stream(path_, std::ios::binary | std::ios::out |
@@ -764,20 +818,23 @@ std::pair<std::shared_ptr<SSTableReader>, Status> SSTableReader::Open(
     TableMetadata metadata{0, path, entries.front().key, entries.back().key,
                            count, file_size};
     return {std::shared_ptr<SSTableReader>(new SSTableReader(
-                path, {}, std::move(entries), false, std::move(metadata),
+                path, {}, std::move(entries), false, {}, 0, 0,
+                std::move(metadata),
                 std::move(block_cache))),
             Status::OK()};
   }
-  const bool compressed_blocks =
-      std::string_view(magic.data(), magic.size()) == kMagic;
+  const bool has_filter = std::string_view(magic.data(), magic.size()) == kMagic;
+  const bool compressed_blocks = has_filter ||
+      std::string_view(magic.data(), magic.size()) == kCompressedLegacyMagic;
   if ((!compressed_blocks &&
        std::string_view(magic.data(), magic.size()) != kIndexedLegacyMagic) ||
-      file_size < kFooterSize) {
+      file_size < (has_filter ? kFilterFooterSize : kFooterSize)) {
     return {nullptr, Status::Corruption("SSTable footer magic mismatch")};
   }
 
-  std::string footer(kFooterSize, '\0');
-  stream.seekg(end - static_cast<std::streamoff>(kFooterSize));
+  const std::size_t footer_size = has_filter ? kFilterFooterSize : kFooterSize;
+  std::string footer(footer_size, '\0');
+  stream.seekg(end - static_cast<std::streamoff>(footer_size));
   stream.read(footer.data(), static_cast<std::streamsize>(footer.size()));
   std::size_t offset = 0;
   std::uint64_t entry_count = 0;
@@ -788,8 +845,43 @@ std::pair<std::shared_ptr<SSTableReader>, Status> SSTableReader::Open(
       !ReadFixed(std::string_view(footer), &offset, &index_offset) ||
       !ReadFixed(std::string_view(footer), &offset, &index_size) ||
       !ReadFixed(std::string_view(footer), &offset, &index_checksum) ||
-      index_offset > file_size - kFooterSize ||
-      index_size != file_size - kFooterSize - index_offset) {
+      index_offset > file_size - footer_size) {
+    return {nullptr, Status::Corruption("SSTable index bounds mismatch")};
+  }
+  std::uint64_t filter_offset = file_size - footer_size;
+  std::uint64_t filter_size = 0;
+  std::uint64_t filter_bit_count = 0;
+  std::uint32_t filter_probes = 0;
+  std::uint32_t filter_checksum = 0;
+  std::string filter;
+  if (has_filter) {
+    if (!ReadFixed(std::string_view(footer), &offset, &filter_offset) ||
+        !ReadFixed(std::string_view(footer), &offset, &filter_size) ||
+        !ReadFixed(std::string_view(footer), &offset, &filter_checksum) ||
+        filter_offset != index_offset + index_size || filter_size < 24 ||
+        filter_size != file_size - footer_size - filter_offset) {
+      return {nullptr, Status::Corruption("SSTable filter bounds mismatch")};
+    }
+    filter.resize(static_cast<std::size_t>(filter_size));
+    stream.seekg(static_cast<std::streamoff>(filter_offset));
+    stream.read(filter.data(), static_cast<std::streamsize>(filter.size()));
+    if (!stream) return {nullptr, Status::IOError("failed to read SSTable filter")};
+    if (Checksum(filter) != filter_checksum) {
+      return {nullptr, Status::Corruption("SSTable filter checksum mismatch")};
+    }
+    std::size_t filter_cursor = 0;
+    std::uint32_t filter_version = 0;
+    if (!ReadFixed(std::string_view(filter), &filter_cursor, &filter_version) ||
+        !ReadFixed(std::string_view(filter), &filter_cursor, &filter_probes) ||
+        !ReadFixed(std::string_view(filter), &filter_cursor, &filter_bit_count) ||
+        filter_version != kBloomFilterVersion || filter_probes == 0 ||
+        filter_probes > 30 || filter_bit_count < 64 ||
+        filter_bit_count % 8 != 0 ||
+        filter_cursor + filter_bit_count / 8 != filter.size()) {
+      return {nullptr, Status::Corruption("invalid SSTable Bloom filter")};
+    }
+    filter.erase(0, filter_cursor);
+  } else if (index_size != file_size - footer_size - index_offset) {
     return {nullptr, Status::Corruption("SSTable index bounds mismatch")};
   }
   std::string index_data(static_cast<std::size_t>(index_size), '\0');
@@ -822,7 +914,8 @@ std::pair<std::shared_ptr<SSTableReader>, Status> SSTableReader::Open(
   TableMetadata metadata{0, path, {}, index.back().last_key, entry_count,
                          file_size};
   auto reader = std::shared_ptr<SSTableReader>(new SSTableReader(
-      path, std::move(index), {}, compressed_blocks, std::move(metadata),
+      path, std::move(index), {}, compressed_blocks, std::move(filter),
+      filter_bit_count, filter_probes, std::move(metadata),
       std::move(block_cache)));
   auto [first, first_status] = reader->ReadBlock(0);
   if (!first_status.ok()) {
@@ -851,6 +944,10 @@ TableLookup SSTableReader::Lookup(std::string_view key) const {
     return TableLookup{true, it->type == RecordType::kDelete,
                        it->type == RecordType::kPut ? it->value : "",
                        Status::OK()};
+  }
+  if (!bloom_filter_.empty() &&
+      !BloomMayContain(bloom_filter_, bloom_bit_count_, bloom_probes_, key)) {
+    return {};
   }
   const auto block_it = std::lower_bound(
       index_.begin(), index_.end(), key,
@@ -944,12 +1041,16 @@ void SSTableReader::MarkObsolete() { obsolete_ = true; }
 SSTableReader::SSTableReader(
     std::filesystem::path path, std::vector<BlockIndexEntry> index,
     std::vector<TableEntry> legacy_entries, bool compressed_blocks,
-    TableMetadata metadata,
+    std::string bloom_filter, std::uint64_t bloom_bit_count,
+    std::uint32_t bloom_probes, TableMetadata metadata,
     std::shared_ptr<BlockCache> block_cache)
     : path_(std::move(path)),
       index_(std::move(index)),
       legacy_entries_(std::move(legacy_entries)),
       compressed_blocks_(compressed_blocks),
+      bloom_filter_(std::move(bloom_filter)),
+      bloom_bit_count_(bloom_bit_count),
+      bloom_probes_(bloom_probes),
       metadata_(std::move(metadata)),
       block_cache_(std::move(block_cache)) {}
 

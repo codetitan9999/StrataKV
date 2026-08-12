@@ -84,7 +84,9 @@ class SSTableReader : public std::enable_shared_from_this<SSTableReader> {
   SSTableReader(std::filesystem::path path,
                 std::vector<TableBlockIndexEntry> index,
                 std::vector<TableEntry> legacy_entries,
-                bool compressed_blocks, TableMetadata metadata,
+                bool compressed_blocks, std::string bloom_filter,
+                std::uint64_t bloom_bit_count, std::uint32_t bloom_probes,
+                TableMetadata metadata,
                 std::shared_ptr<BlockCache> block_cache);
   std::pair<std::shared_ptr<const std::vector<TableEntry>>, Status> ReadBlock(
       std::size_t block_index) const;
@@ -95,6 +97,9 @@ class SSTableReader : public std::enable_shared_from_this<SSTableReader> {
   std::vector<TableBlockIndexEntry> index_;
   std::vector<TableEntry> legacy_entries_;
   bool compressed_blocks_ = false;
+  std::string bloom_filter_;
+  std::uint64_t bloom_bit_count_ = 0;
+  std::uint32_t bloom_probes_ = 0;
   TableMetadata metadata_;
   std::shared_ptr<BlockCache> block_cache_;
   bool obsolete_ = false;

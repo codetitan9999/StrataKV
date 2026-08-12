@@ -73,6 +73,25 @@ std::uint32_t Checksum(const std::string& payload) {
   return hash;
 }
 
+std::string BloomFilter(const std::vector<std::string>& keys) {
+  std::string bits(8, '\0');
+  for (const auto& key : keys) {
+    std::uint32_t hash = Checksum(key);
+    const std::uint32_t delta = (hash >> 17) | (hash << 15);
+    for (int probe = 0; probe < 7; ++probe) {
+      const std::size_t bit = hash % 64;
+      bits[bit / 8] |= static_cast<char>(1U << (bit % 8));
+      hash += delta;
+    }
+  }
+  std::string filter;
+  AppendFixed(&filter, 1, 4);
+  AppendFixed(&filter, 7, 4);
+  AppendFixed(&filter, 64, 8);
+  filter.append(bits);
+  return filter;
+}
+
 std::uint64_t ReadFixed(const std::string& input, std::size_t offset,
                         std::size_t bytes) {
   std::uint64_t value = 0;
@@ -271,11 +290,15 @@ void DetectsCorruptIndexBlock(TestRunner* runner) {
   stratakv::TableMetadata metadata;
   runner->ExpectOk(builder.Finish(&metadata), "finish indexed table");
 
-  constexpr std::streamoff kFooterSize = 36;
+  constexpr std::streamoff kFooterSize = 56;
   std::fstream stream(table_path, std::ios::binary | std::ios::in |
                                       std::ios::out | std::ios::ate);
   const std::streamoff file_size = static_cast<std::streamoff>(stream.tellg());
-  const std::streamoff index_byte = file_size - kFooterSize - 1;
+  std::string footer(static_cast<std::size_t>(kFooterSize), '\0');
+  stream.seekg(file_size - kFooterSize);
+  stream.read(footer.data(), kFooterSize);
+  const std::streamoff index_byte = static_cast<std::streamoff>(
+      ReadFixed(footer, 28, 8) - 1);
   stream.seekg(index_byte);
   char byte = 0;
   stream.read(&byte, 1);
@@ -351,11 +374,17 @@ void WritesGoldenPrefixCompressedBlock(TestRunner* runner) {
   AppendFixed(&index, index_offset, 8);
   AppendFixed(&index, 2, 8);
   expected.append(index);
+  const std::uint64_t filter_offset = expected.size();
+  const std::string filter = BloomFilter({"alpine", "alps"});
+  expected.append(filter);
   AppendFixed(&expected, 2, 8);
   AppendFixed(&expected, index_offset, 8);
   AppendFixed(&expected, index.size(), 8);
   AppendFixed(&expected, Checksum(index), 4);
-  expected.append("STKV0003");
+  AppendFixed(&expected, filter_offset, 8);
+  AppendFixed(&expected, filter.size(), 8);
+  AppendFixed(&expected, Checksum(filter), 4);
+  expected.append("STKV0004");
 
   runner->Expect(ReadFile(table_path) == expected,
                  "prefix-compressed encoding matches golden bytes");
@@ -371,7 +400,7 @@ void DetectsCorruptRestartArray(TestRunner* runner) {
   runner->ExpectOk(builder.Finish(&metadata), "finish restart table");
 
   std::string file = ReadFile(table_path);
-  constexpr std::size_t kFooterSize = 36;
+  constexpr std::size_t kFooterSize = 56;
   const std::size_t index_offset = static_cast<std::size_t>(
       ReadFixed(file, file.size() - kFooterSize + 8, 8));
   const std::size_t restart_offset = index_offset - 4 - 4 - 4;
@@ -423,6 +452,36 @@ void ReadsLegacyIndexedTable(TestRunner* runner) {
   auto [value, get_status] = reader->Get("beta");
   runner->ExpectOk(get_status, "read legacy indexed value");
   runner->Expect(value == "two", "legacy indexed table value");
+}
+
+void ReadsLegacyCompressedTable(TestRunner* runner) {
+  TempDir dir;
+  const auto table_path = dir.path() / "000001.sst";
+  stratakv::SSTableBuilder builder(table_path);
+  runner->ExpectOk(builder.Add("alpha", "one"), "add legacy compressed key");
+  runner->ExpectOk(builder.Add("beta", "two"), "add legacy compressed value");
+  stratakv::TableMetadata metadata;
+  runner->ExpectOk(builder.Finish(&metadata), "finish source compressed table");
+
+  std::string file = ReadFile(table_path);
+  constexpr std::size_t kFilterFooterSize = 56;
+  const std::size_t footer = file.size() - kFilterFooterSize;
+  const std::size_t filter_offset =
+      static_cast<std::size_t>(ReadFixed(file, footer + 28, 8));
+  const std::string legacy_footer = file.substr(footer, 28);
+  file.resize(filter_offset);
+  file.append(legacy_footer);
+  file.append("STKV0003");
+  std::ofstream stream(table_path, std::ios::binary | std::ios::trunc);
+  stream.write(file.data(), static_cast<std::streamsize>(file.size()));
+  stream.close();
+
+  auto [reader, status] = stratakv::SSTableReader::Open(table_path);
+  runner->ExpectOk(status, "open legacy compressed table");
+  if (!reader) return;
+  auto [value, get_status] = reader->Get("beta");
+  runner->ExpectOk(get_status, "read legacy compressed value");
+  runner->Expect(value == "two", "legacy compressed table value");
 }
 
 void CompressesSharedKeyPrefixes(TestRunner* runner) {
@@ -488,7 +547,7 @@ void DetectsCorruptionInSearchedRestartKey(TestRunner* runner) {
   if (!reader) return;
 
   std::string file = ReadFile(table_path);
-  constexpr std::size_t kFooterSize = 36;
+  constexpr std::size_t kFooterSize = 56;
   const std::size_t index_offset = static_cast<std::size_t>(
       ReadFixed(file, file.size() - kFooterSize + 8, 8));
   std::size_t index_cursor = index_offset;
@@ -527,6 +586,62 @@ void DetectsCorruptionInSearchedRestartKey(TestRunner* runner) {
   const auto lookup = reader->Lookup(lookup_key);
   runner->Expect(lookup.status.code() == stratakv::Status::Code::kCorruption,
                  "point lookup validates searched restart keys");
+}
+
+void BloomFilterSkipsAbsentDataBlocks(TestRunner* runner) {
+  TempDir dir;
+  const auto table_path = dir.path() / "000001.sst";
+  stratakv::SSTableBuilder builder(table_path, 64);
+  for (int i = 0; i < 100; ++i) {
+    const std::string key = "key-" + std::to_string(1000 + i * 2);
+    runner->ExpectOk(builder.Add(key, "value"), "add Bloom filter key");
+  }
+  stratakv::TableMetadata metadata;
+  runner->ExpectOk(builder.Finish(&metadata), "finish Bloom filter table");
+  auto cache = std::make_shared<stratakv::BlockCache>(1 << 20);
+  auto [reader, status] = stratakv::SSTableReader::Open(table_path, cache);
+  runner->ExpectOk(status, "open Bloom filter table");
+  if (!reader) return;
+
+  const auto misses_before = cache->stats().misses;
+  const auto missing = reader->Lookup("key-1197");
+  runner->Expect(missing.status.ok() && !missing.found,
+                 "Bloom filter rejects an absent in-range key");
+  runner->Expect(cache->stats().misses == misses_before,
+                 "negative lookup avoids reading its data block");
+
+  auto [value, get_status] = reader->Get("key-1198");
+  runner->ExpectOk(get_status, "Bloom filter preserves present keys");
+  runner->Expect(value == "value", "present key survives Bloom filtering");
+  runner->Expect(cache->stats().misses == misses_before + 1,
+                 "present lookup reads the selected data block");
+}
+
+void DetectsCorruptBloomFilter(TestRunner* runner) {
+  TempDir dir;
+  const auto table_path = dir.path() / "000001.sst";
+  stratakv::SSTableBuilder builder(table_path);
+  runner->ExpectOk(builder.Add("alpha", "one"), "add filtered key");
+  runner->ExpectOk(builder.Add("beta", "two"), "add second filtered key");
+  stratakv::TableMetadata metadata;
+  runner->ExpectOk(builder.Finish(&metadata), "finish filtered table");
+
+  std::string file = ReadFile(table_path);
+  constexpr std::size_t kFooterSize = 56;
+  const std::size_t footer = file.size() - kFooterSize;
+  const std::size_t filter_offset =
+      static_cast<std::size_t>(ReadFixed(file, footer + 28, 8));
+  runner->Expect(filter_offset < footer, "filter block precedes footer");
+  if (filter_offset >= footer) return;
+  file[filter_offset] ^= 0x01;
+  std::ofstream stream(table_path, std::ios::binary | std::ios::trunc);
+  stream.write(file.data(), static_cast<std::streamsize>(file.size()));
+  stream.close();
+
+  auto [reader, status] = stratakv::SSTableReader::Open(table_path);
+  (void)reader;
+  runner->Expect(status.code() == stratakv::Status::Code::kCorruption,
+                 "corrupted Bloom filter fails checksum verification");
 }
 
 void LazilyReadsAndCachesDataBlocks(TestRunner* runner) {
@@ -598,9 +713,12 @@ int main() {
   WritesGoldenPrefixCompressedBlock(&runner);
   DetectsCorruptRestartArray(&runner);
   ReadsLegacyIndexedTable(&runner);
+  ReadsLegacyCompressedTable(&runner);
   CompressesSharedKeyPrefixes(&runner);
   UsesRestartIndexForPointLookups(&runner);
   DetectsCorruptionInSearchedRestartKey(&runner);
+  BloomFilterSkipsAbsentDataBlocks(&runner);
+  DetectsCorruptBloomFilter(&runner);
   LazilyReadsAndCachesDataBlocks(&runner);
   EnforcesSharedCacheBudget(&runner);
   return runner.Finish();
