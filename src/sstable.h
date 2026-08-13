@@ -19,6 +19,7 @@ namespace stratakv {
 
 struct TableMetadata {
   std::uint64_t file_number = 0;
+  std::uint32_t level = 0;
   std::filesystem::path file_path;
   std::string smallest_key;
   std::string largest_key;

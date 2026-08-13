@@ -815,7 +815,7 @@ std::pair<std::shared_ptr<SSTableReader>, Status> SSTableReader::Open(
     if (!status.ok()) {
       return {nullptr, status};
     }
-    TableMetadata metadata{0, path, entries.front().key, entries.back().key,
+    TableMetadata metadata{0, 0, path, entries.front().key, entries.back().key,
                            count, file_size};
     return {std::shared_ptr<SSTableReader>(new SSTableReader(
                 path, {}, std::move(entries), false, {}, 0, 0,
@@ -911,7 +911,7 @@ std::pair<std::shared_ptr<SSTableReader>, Status> SSTableReader::Open(
   if (expected_offset != index_offset || indexed_entries != entry_count) {
     return {nullptr, Status::Corruption("SSTable entry count mismatch")};
   }
-  TableMetadata metadata{0, path, {}, index.back().last_key, entry_count,
+  TableMetadata metadata{0, 0, path, {}, index.back().last_key, entry_count,
                          file_size};
   auto reader = std::shared_ptr<SSTableReader>(new SSTableReader(
       path, std::move(index), {}, compressed_blocks, std::move(filter),

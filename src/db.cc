@@ -21,6 +21,7 @@
 #include "memtable.h"
 #include "record.h"
 #include "sstable.h"
+#include "version_set.h"
 #include "wal.h"
 
 namespace stratakv {
@@ -267,6 +268,7 @@ class DBImpl final : public DB {
  private:
   struct TableState {
     std::uint64_t file_number = 0;
+    std::uint32_t level = 0;
     std::shared_ptr<SSTableReader> reader;
   };
 
@@ -291,6 +293,10 @@ class DBImpl final : public DB {
     }
 
     for (const auto& [file_number, manifest_metadata] : active_tables) {
+      Status version_status = version_set_.AddTable(manifest_metadata);
+      if (!version_status.ok()) {
+        return version_status;
+      }
       const std::filesystem::path path = TablePath(table_dir_, file_number);
       auto [table_reader, status] =
           SSTableReader::Open(path, block_cache_);
@@ -307,7 +313,8 @@ class DBImpl final : public DB {
                                   path.string());
       }
 
-      tables_.push_back(TableState{file_number, std::move(table_reader)});
+      tables_.push_back(TableState{file_number, manifest_metadata.level,
+                                   std::move(table_reader)});
     }
 
     return Status::OK();
@@ -357,6 +364,7 @@ class DBImpl final : public DB {
       return finish_status;
     }
     metadata.file_number = file_number;
+    metadata.level = 0;
     metadata.file_path = final_path;
 
     Status install_status = file_system_->SyncFile(temporary_path);
@@ -386,7 +394,11 @@ class DBImpl final : public DB {
     if (!open_status.ok()) {
       return open_status;
     }
-    tables_.push_back(TableState{file_number, std::move(reader)});
+    Status version_status = version_set_.AddTable(metadata);
+    if (!version_status.ok()) {
+      return version_status;
+    }
+    tables_.push_back(TableState{file_number, 0, std::move(reader)});
 
     Status wal_status = ResetWal();
     if (!wal_status.ok()) {
@@ -399,7 +411,7 @@ class DBImpl final : public DB {
 
   Status MaybeCompactTables() {
     if (options_.level0_compaction_trigger == 0 ||
-        tables_.size() < options_.level0_compaction_trigger ||
+        version_set_.LevelTableCount(0) < options_.level0_compaction_trigger ||
         tables_.size() < 2) {
       return Status::OK();
     }
@@ -446,6 +458,7 @@ class DBImpl final : public DB {
         return finish_status;
       }
       metadata.file_number = file_number;
+      metadata.level = 1;
       metadata.file_path = final_path;
 
       Status install_status = file_system_->SyncFile(temporary_path);
@@ -467,7 +480,7 @@ class DBImpl final : public DB {
         return open_status;
       }
 
-      next_tables.push_back(TableState{file_number, std::move(reader)});
+      next_tables.push_back(TableState{file_number, 1, std::move(reader)});
     }
 
     std::vector<TableMetadata> manifest_snapshot;
@@ -475,6 +488,7 @@ class DBImpl final : public DB {
     for (const TableState& table : next_tables) {
       manifest_snapshot.push_back(table.reader->metadata());
       manifest_snapshot.back().file_number = table.file_number;
+      manifest_snapshot.back().level = table.level;
     }
     Status manifest_status =
         manifest_->ReplaceWithSnapshot(manifest_snapshot);
@@ -487,6 +501,16 @@ class DBImpl final : public DB {
     }
 
     tables_ = std::move(next_tables);
+    version_set_ = VersionSet();
+    for (const TableState& table : tables_) {
+      TableMetadata metadata = table.reader->metadata();
+      metadata.file_number = table.file_number;
+      metadata.level = table.level;
+      Status version_status = version_set_.AddTable(std::move(metadata));
+      if (!version_status.ok()) {
+        return version_status;
+      }
+    }
     return Status::OK();
   }
 
@@ -546,6 +570,7 @@ class DBImpl final : public DB {
   mutable std::mutex mu_;
   MemTable memtable_;
   std::vector<TableState> tables_;
+  VersionSet version_set_;
   std::uint64_t last_sequence_ = 0;
   std::uint64_t next_file_number_ = 1;
   std::unique_ptr<ManifestWriter> manifest_;

@@ -17,6 +17,7 @@ namespace {
 enum class ManifestRecordType : std::uint8_t {
   kTableAdded = 1,
   kTableDeleted = 2,
+  kLeveledTableAdded = 3,
 };
 
 template <typename UInt>
@@ -92,8 +93,10 @@ Status EncodeTableAdded(const TableMetadata& metadata, std::string* payload) {
 
   payload->clear();
   AppendFixed<std::uint8_t>(
-      *payload, static_cast<std::uint8_t>(ManifestRecordType::kTableAdded));
+      *payload,
+      static_cast<std::uint8_t>(ManifestRecordType::kLeveledTableAdded));
   AppendFixed<std::uint64_t>(*payload, metadata.file_number);
+  AppendFixed<std::uint32_t>(*payload, metadata.level);
   AppendFixed<std::uint64_t>(*payload, metadata.entry_count);
   AppendFixed<std::uint64_t>(*payload, metadata.file_size_bytes);
   AppendFixed<std::uint32_t>(
@@ -144,17 +147,22 @@ Status DecodeRecord(std::string_view payload, ManifestEdit* edit) {
     return Status::OK();
   }
 
-  if (type != static_cast<std::uint8_t>(ManifestRecordType::kTableAdded)) {
+  const bool leveled = type == static_cast<std::uint8_t>(
+                                  ManifestRecordType::kLeveledTableAdded);
+  if (!leveled &&
+      type != static_cast<std::uint8_t>(ManifestRecordType::kTableAdded)) {
     return Status::Corruption("invalid manifest record type");
   }
 
   std::uint64_t file_number = 0;
+  std::uint32_t level = 0;
   std::uint64_t entry_count = 0;
   std::uint64_t file_size_bytes = 0;
   std::uint32_t smallest_key_size = 0;
   std::uint32_t largest_key_size = 0;
 
   if (!ReadFixed(payload, &offset, &file_number) ||
+      (leveled && !ReadFixed(payload, &offset, &level)) ||
       !ReadFixed(payload, &offset, &entry_count) ||
       !ReadFixed(payload, &offset, &file_size_bytes) ||
       !ReadFixed(payload, &offset, &smallest_key_size) ||
@@ -171,6 +179,7 @@ Status DecodeRecord(std::string_view payload, ManifestEdit* edit) {
   edit->type = ManifestEditType::kTableAdded;
   edit->file_number = file_number;
   edit->table.file_number = file_number;
+  edit->table.level = level;
   edit->table.entry_count = entry_count;
   edit->table.file_size_bytes = file_size_bytes;
   edit->table.smallest_key.assign(payload.substr(offset, smallest_key_size));

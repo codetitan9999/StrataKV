@@ -20,6 +20,7 @@ add_library(stratakv
   src/merge_iterator.cc
   src/sstable.cc
   src/status.cc
+  src/version_set.cc
   src/wal.cc
 )
 
@@ -91,6 +92,11 @@ if(STRATAKV_BUILD_TESTS)
   )
 
   add_test(NAME stratakv_sstable_tests COMMAND stratakv_sstable_tests)
+
+  add_executable(stratakv_version_set_tests tests/version_set_test.cc)
+  target_link_libraries(stratakv_version_set_tests PRIVATE stratakv)
+  target_include_directories(stratakv_version_set_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME stratakv_version_set_tests COMMAND stratakv_version_set_tests)
 endif()
 
 if(STRATAKV_BUILD_BENCHMARKS)

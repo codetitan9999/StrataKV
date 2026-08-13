@@ -101,9 +101,11 @@ class RecordingFileSystem final : public stratakv::FileSystem {
 
 stratakv::TableMetadata Metadata(std::uint64_t file_number,
                                  std::string smallest_key,
-                                 std::string largest_key) {
+                                 std::string largest_key,
+                                 std::uint32_t level = 0) {
   stratakv::TableMetadata metadata;
   metadata.file_number = file_number;
+  metadata.level = level;
   metadata.file_path = std::to_string(file_number) + ".sst";
   metadata.smallest_key = std::move(smallest_key);
   metadata.largest_key = std::move(largest_key);
@@ -137,6 +139,25 @@ void ReplaysAppendedTables(TestRunner* runner) {
 
   runner->Expect(file_numbers == std::vector<std::uint64_t>({1, 2}),
                  "manifest should replay table records in append order");
+}
+
+void PersistsTableLevels(TestRunner* runner) {
+  TempDir dir;
+  const auto manifest_path = dir.path() / "MANIFEST";
+  stratakv::ManifestWriter writer(manifest_path);
+  runner->ExpectOk(writer.Open(/*append=*/false), "open leveled manifest");
+  runner->ExpectOk(writer.AppendTable(Metadata(7, "a", "z", 2)),
+                   "append leveled table");
+  runner->ExpectOk(writer.Sync(), "sync leveled manifest");
+
+  std::uint32_t replayed_level = 0;
+  stratakv::ManifestReader reader(manifest_path);
+  runner->ExpectOk(reader.Replay([&](const stratakv::ManifestEdit& edit) {
+                     replayed_level = edit.table.level;
+                     return stratakv::Status::OK();
+                   }),
+                   "replay leveled manifest");
+  runner->Expect(replayed_level == 2, "manifest should preserve table level");
 }
 
 void RejectsInvalidMetadata(TestRunner* runner) {
@@ -300,6 +321,7 @@ void PreservesManifestWhenSnapshotRenameFails(TestRunner* runner) {
 int main() {
   TestRunner runner;
   ReplaysAppendedTables(&runner);
+  PersistsTableLevels(&runner);
   RejectsInvalidMetadata(&runner);
   ReplaysTableDeletions(&runner);
   RejectsInvalidDeletions(&runner);
