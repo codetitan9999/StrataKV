@@ -22,6 +22,7 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - Memtable flush to SSTables with WAL rotation
 - Reads from both memtable and flushed SSTables
 - Checksummed manifest records with atomic snapshot replacement during compaction
+- Manifest-persisted table levels with validated version-set invariants
 - Durable SSTable and manifest installation with injectable filesystem failures
 - Automatic SSTable compaction with obsolete-file cleanup
 - Dependency-free unit tests
@@ -53,7 +54,9 @@ The write path is intentionally straightforward:
    manifest record makes it discoverable on restart.
 6. The WAL is rotated through a recoverable renamed generation with directory
    syncs after a successful flush.
-7. When enough flushed tables accumulate, compaction merges them into one table and atomically replaces the manifest with a compact snapshot.
+7. When enough level-0 tables accumulate, compaction merges the current version
+   into a non-overlapping level-1 table and atomically replaces the manifest
+   with a compact snapshot.
 8. On restart, manifest-listed SSTables are loaded first, then the WAL is replayed up to the last complete record.
 
 `Options::max_wal_record_size` bounds both newly written records and recovery
@@ -89,7 +92,7 @@ docs/               architecture notes
 
 ### Phase 1: Storage Engine
 
-- Overlap-aware leveled compaction
+- Overlap-aware compaction selection and multi-file level sizing
 - More recovery and corruption tests
 - Benchmarks for writes, reads, scans, recovery, and compaction
 

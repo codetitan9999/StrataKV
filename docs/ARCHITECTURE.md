@@ -21,6 +21,7 @@ The public API is deliberately small. It should remain stable while internals ev
 
 - `src/wal.*`: append-only binary log with per-record checksums
 - `src/manifest.*`: checksummed metadata log and compact snapshots for installed SSTables
+- `src/version_set.*`: active table levels, ordering, and overlap invariants
 - `src/memtable.*`: sorted mutable map storing latest value or tombstone
 - `src/compaction.*`: merge logic for flushed SSTables
 - `src/file_system.*`: durability-critical file sync, rename, directory sync,
@@ -54,7 +55,7 @@ Reads follow this order:
 
 1. mutable memtable
 2. newest-to-oldest manifest-listed SSTables by key range
-3. future leveled SSTables once multi-level compaction is introduced
+3. sorted non-overlapping levels, from lower to higher level numbers
 
 Deletes are tombstones, not immediate removals from history. Compaction decides when a tombstone is safe to drop.
 
@@ -122,13 +123,25 @@ Bloom-filtered `STKV0004` format.
 
 ### Compaction
 
-`src/compaction.*` merges flushed SSTables in oldest-to-newest order. The first strategy is intentionally simple: when the number of flushed tables reaches `level0_compaction_trigger`, StrataKV compacts all active tables into one replacement table, atomically installs a compact manifest snapshot containing the replacement, and removes obsolete files.
+`src/compaction.*` merges flushed SSTables in oldest-to-newest order. Newly
+flushed tables enter overlapping level 0. `VersionSet` counts those tables for
+the compaction trigger and validates that every level above level 0 has sorted,
+non-overlapping key ranges. The current transition strategy remains deliberately
+simple: when level 0 reaches `level0_compaction_trigger`, StrataKV compacts the
+entire active version into one level-1 replacement table, atomically installs a
+compact manifest snapshot containing the replacement, and removes obsolete
+files. This establishes durable level metadata and recovery invariants before
+selection grows to bounded overlapping inputs and multiple output files.
 
 Because this compaction covers every active table, tombstones that only protect against older tables can be dropped from the compacted output.
 
 ### Manifest
 
-`src/manifest.*` stores checksummed table metadata records. On open, StrataKV replays table-add and table-delete edits to decide which SSTables are installed, then replays the WAL for any writes that were not flushed. Directory scans are no longer the source of truth for table membership.
+`src/manifest.*` stores checksummed table metadata records, including each
+table's level. On open, StrataKV replays table-add and table-delete edits into a
+validated version set, then replays the WAL for writes that were not flushed.
+Legacy table-add records without a level remain readable and are interpreted as
+level 0. Directory scans are no longer the source of truth for table membership.
 
 Flushes append and flush a table-add record after installing the SSTable. Full
 compaction instead writes the complete active table set to `MANIFEST.tmp`,
@@ -160,6 +173,8 @@ The core invariants are:
 - Newer records shadow older records for the same key.
 - Tombstones shadow older values until compaction proves they are obsolete.
 - Installed SSTables must be discoverable after crash recovery.
+- Level 0 may overlap; every higher level must contain sorted, non-overlapping
+  key ranges.
 
 ## File Layout
 
@@ -213,13 +228,14 @@ Current tests cover:
 - Iterator snapshot lifetime across compaction and deferred obsolete-file cleanup
 - Memtable flush, SSTable-backed reads, flushed tombstones, and reopen from table files
 - Manifest replay, snapshot replacement, post-snapshot appends, invalid metadata rejection, checksum corruption detection, and missing table handling
+- Version-set read ordering, level-0 overlap, and sorted-level overlap rejection
 - File-sync, rename, and directory-sync ordering plus injected SSTable,
   manifest, and WAL rotation failures
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
 
 Next test layers should add:
 
-- Multi-level compaction correctness with overwritten keys and tombstones
+- Overlap-selected multi-level compaction with overwritten keys and tombstones
 - Fault injection around file creation, rename, and manifest updates
 
 The project starts with a tiny local harness to avoid dependency friction. Once behavior broadens, moving to GoogleTest is reasonable.
@@ -247,7 +263,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 1: Storage Skeleton Hardening
 
-- Add version-set types
+- Select bounded overlapping inputs and emit multiple size-limited level files
 - Add structured logging around open/recovery
 - Extend filesystem fault injection beyond WAL operations to SSTable and
   manifest reads and writes
@@ -263,7 +279,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 4: Iterators and Compaction
 
-- Add overlap-aware leveled compaction
+- Add overlap-aware leveled compaction selection and level-size targets
 - Track read/write amplification in benchmarks
 
 ### Milestone 5: Networked Store
