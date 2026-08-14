@@ -9,6 +9,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -655,6 +656,49 @@ void CompactionDropsCoveredTombstones(TestRunner* runner) {
   runner->Expect(beta == "two", "beta should survive compaction");
 }
 
+void CompactionSplitsOutputsAndRetainsDisjointLevelFiles(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.level0_compaction_trigger = 3;
+  options.max_compaction_output_file_size = 20;
+
+  auto db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "a", "old-a"),
+                   "put first a");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "m", "old-m"),
+                   "put first m");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "z", "old-z"),
+                   "put disjoint z");
+  runner->Expect(CountSSTables(dir.path()) == 3,
+                 "first compaction should split into three level files");
+
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "a", "new-a"),
+                   "overwrite a");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "n", "new-n"),
+                   "put n");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "y", "new-y"),
+                   "put y to compact overlapping range");
+  runner->Expect(CountSSTables(dir.path()) == 5,
+                 "second compaction should retain disjoint z table");
+
+  auto [a, a_status] = db->Get(stratakv::ReadOptions{}, "a");
+  runner->ExpectOk(a_status, "get overwritten a");
+  runner->Expect(a == "new-a", "newest level-zero value should win");
+  auto [z, z_status] = db->Get(stratakv::ReadOptions{}, "z");
+  runner->ExpectOk(z_status, "get retained z");
+  runner->Expect(z == "old-z", "disjoint level-one table should be retained");
+
+  db.reset();
+  db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+  std::tie(z, z_status) = db->Get(stratakv::ReadOptions{}, "z");
+  runner->ExpectOk(z_status, "get retained z after reopen");
+  runner->Expect(z == "old-z", "retained table should survive manifest replay");
+}
+
 void IteratorSurvivesCompactionCleanup(TestRunner* runner) {
   TempDir dir;
   stratakv::Options options;
@@ -709,6 +753,7 @@ int main() {
   MissingManifestTableFailsOpen(&runner);
   CompactsFlushedTables(&runner);
   CompactionDropsCoveredTombstones(&runner);
+  CompactionSplitsOutputsAndRetainsDisjointLevelFiles(&runner);
   IteratorSurvivesCompactionCleanup(&runner);
   return runner.Finish();
 }

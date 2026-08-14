@@ -24,9 +24,13 @@ struct Options {
   // A value of 0 disables block caching while preserving lazy reads.
   std::size_t block_cache_size = 8 * 1024 * 1024;
 
-  // Number of flushed SSTables that triggers a full single-level compaction.
+  // Number of flushed SSTables that triggers level-0 compaction.
   // A value of 0 disables automatic compaction.
   std::size_t level0_compaction_trigger = 4;
+
+  // Approximate maximum logical bytes emitted into one compaction output.
+  // A value of 0 emits a single output table.
+  std::size_t max_compaction_output_file_size = 2 * 1024 * 1024;
 
   // Durably sync the WAL file after each write.
   bool fsync_wal = false;

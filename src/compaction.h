@@ -11,10 +11,11 @@ namespace stratakv {
 
 struct CompactionInput {
   std::vector<const SSTableReader*> tables;
+  std::size_t max_output_file_size = 0;
 };
 
 struct CompactionOutput {
-  std::vector<TableEntry> entries;
+  std::vector<std::vector<TableEntry>> files;
 };
 
 class CompactionJob {

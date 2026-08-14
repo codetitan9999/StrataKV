@@ -33,10 +33,19 @@ Status CompactionJob::Run(const CompactionInput& input,
     }
   }
 
-  output->entries.clear();
-  output->entries.reserve(live_values.size());
+  output->files.clear();
+  std::size_t output_bytes = 0;
   for (const auto& [key, value] : live_values) {
-    output->entries.push_back(TableEntry{RecordType::kPut, key, value});
+    const std::size_t entry_bytes = key.size() + value.size() + 16;
+    if (!output->files.empty() && !output->files.back().empty() &&
+        input.max_output_file_size > 0 &&
+        output_bytes + entry_bytes > input.max_output_file_size) {
+      output->files.emplace_back();
+      output_bytes = 0;
+    }
+    if (output->files.empty()) output->files.emplace_back();
+    output->files.back().push_back(TableEntry{RecordType::kPut, key, value});
+    output_bytes += entry_bytes;
   }
 
   return Status::OK();

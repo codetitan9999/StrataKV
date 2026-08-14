@@ -47,6 +47,14 @@ int main() {
          "read order should be newest level zero then sorted higher levels");
   expect(version.LevelTableCount(0) == 2, "level zero count should be tracked");
 
+  const auto selection = version.PickLevel0Compaction(1);
+  numbers.clear();
+  for (const auto& table : selection.inputs) numbers.push_back(table.file_number);
+  expect(numbers == std::vector<std::uint64_t>({3, 4, 1}),
+         "selection should include overlapping level one before oldest level zero");
+  expect(selection.smallest_key == "b" && selection.largest_key == "z",
+         "selection should report the level-zero key range");
+
   if (failures == 0) std::cout << "All version-set tests passed\n";
   return failures == 0 ? 0 : 1;
 }

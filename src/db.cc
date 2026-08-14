@@ -317,6 +317,8 @@ class DBImpl final : public DB {
                                    std::move(table_reader)});
     }
 
+    SortTablesForReads();
+
     return Status::OK();
   }
 
@@ -399,6 +401,7 @@ class DBImpl final : public DB {
       return version_status;
     }
     tables_.push_back(TableState{file_number, 0, std::move(reader)});
+    SortTablesForReads();
 
     Status wal_status = ResetWal();
     if (!wal_status.ok()) {
@@ -420,10 +423,22 @@ class DBImpl final : public DB {
   }
 
   Status CompactTables() {
+    const VersionSet::CompactionSelection selection =
+        version_set_.PickLevel0Compaction(options_.level0_compaction_trigger);
+    if (selection.inputs.empty()) return Status::OK();
+
     CompactionInput input;
-    input.tables.reserve(tables_.size());
-    for (const TableState& table : tables_) {
-      input.tables.push_back(table.reader.get());
+    input.max_output_file_size = options_.max_compaction_output_file_size;
+    input.tables.reserve(selection.inputs.size());
+    for (const TableMetadata& metadata : selection.inputs) {
+      const auto it = std::find_if(
+          tables_.begin(), tables_.end(), [&](const TableState& table) {
+            return table.file_number == metadata.file_number;
+          });
+      if (it == tables_.end()) {
+        return Status::Corruption("selected compaction table is not open");
+      }
+      input.tables.push_back(it->reader.get());
     }
 
     CompactionOutput output;
@@ -434,7 +449,16 @@ class DBImpl final : public DB {
     }
 
     std::vector<TableState> next_tables;
-    if (!output.entries.empty()) {
+    for (const TableState& table : tables_) {
+      const bool selected = std::any_of(
+          selection.inputs.begin(), selection.inputs.end(),
+          [&](const TableMetadata& metadata) {
+            return metadata.file_number == table.file_number;
+          });
+      if (!selected) next_tables.push_back(table);
+    }
+
+    for (const auto& output_entries : output.files) {
       const std::uint64_t file_number = next_file_number_++;
       const std::filesystem::path final_path =
           TablePath(table_dir_, file_number);
@@ -442,7 +466,7 @@ class DBImpl final : public DB {
           final_path.string() + ".tmp";
 
       SSTableBuilder builder(temporary_path);
-      for (const TableEntry& entry : output.entries) {
+      for (const TableEntry& entry : output_entries) {
         Status add_status =
             entry.type == RecordType::kDelete
                 ? builder.AddDeletion(entry.key)
@@ -497,10 +521,16 @@ class DBImpl final : public DB {
     }
 
     for (TableState& table : tables_) {
-      table.reader->MarkObsolete();
+      const bool selected = std::any_of(
+          selection.inputs.begin(), selection.inputs.end(),
+          [&](const TableMetadata& metadata) {
+            return metadata.file_number == table.file_number;
+          });
+      if (selected) table.reader->MarkObsolete();
     }
 
     tables_ = std::move(next_tables);
+    SortTablesForReads();
     version_set_ = VersionSet();
     for (const TableState& table : tables_) {
       TableMetadata metadata = table.reader->metadata();
@@ -512,6 +542,18 @@ class DBImpl final : public DB {
       }
     }
     return Status::OK();
+  }
+
+  void SortTablesForReads() {
+    std::sort(tables_.begin(), tables_.end(),
+              [](const TableState& left, const TableState& right) {
+                if (left.level != right.level) return left.level > right.level;
+                if (left.level == 0) {
+                  return left.file_number < right.file_number;
+                }
+                return left.reader->metadata().smallest_key <
+                       right.reader->metadata().smallest_key;
+              });
   }
 
   Status ResetWal() {

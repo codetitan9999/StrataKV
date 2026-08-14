@@ -61,4 +61,44 @@ std::size_t VersionSet::LevelTableCount(std::uint32_t level) const {
       }));
 }
 
+VersionSet::CompactionSelection VersionSet::PickLevel0Compaction(
+    std::size_t level0_input_count) const {
+  CompactionSelection selection;
+  if (level0_input_count == 0) return selection;
+
+  std::vector<TableMetadata> level0;
+  for (const auto& [file_number, table] : tables_) {
+    (void)file_number;
+    if (table.level == 0) level0.push_back(table);
+  }
+  std::sort(level0.begin(), level0.end(), [](const auto& left, const auto& right) {
+    return left.file_number < right.file_number;
+  });
+  if (level0.empty()) return selection;
+  level0.resize(std::min(level0.size(), level0_input_count));
+
+  selection.smallest_key = level0.front().smallest_key;
+  selection.largest_key = level0.front().largest_key;
+  for (const auto& table : level0) {
+    selection.smallest_key = std::min(selection.smallest_key, table.smallest_key);
+    selection.largest_key = std::max(selection.largest_key, table.largest_key);
+  }
+
+  // Existing level-1 data is older than every level-0 input and must be
+  // merged first so newer level-0 records win.
+  for (const auto& [file_number, table] : tables_) {
+    (void)file_number;
+    if (table.level == 1 && table.smallest_key <= selection.largest_key &&
+        selection.smallest_key <= table.largest_key) {
+      selection.inputs.push_back(table);
+    }
+  }
+  std::sort(selection.inputs.begin(), selection.inputs.end(),
+            [](const auto& left, const auto& right) {
+              return left.smallest_key < right.smallest_key;
+            });
+  selection.inputs.insert(selection.inputs.end(), level0.begin(), level0.end());
+  return selection;
+}
+
 }  // namespace stratakv

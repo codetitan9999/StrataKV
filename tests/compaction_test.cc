@@ -101,12 +101,29 @@ void MergesNewestEntriesAndDropsCoveredTombstones(TestRunner* runner) {
   runner->ExpectOk(job.Run(input, &output), "run compaction job");
 
   std::vector<std::string> keys;
-  for (const stratakv::TableEntry& entry : output.entries) {
-    keys.push_back(entry.key);
+  for (const auto& file : output.files) {
+    for (const stratakv::TableEntry& entry : file) keys.push_back(entry.key);
   }
 
   runner->Expect(keys == std::vector<std::string>({"beta", "gamma"}),
                  "compaction should keep only visible keys");
+}
+
+void SplitsOutputsAtConfiguredSize(TestRunner* runner) {
+  TempDir dir;
+  auto table = BuildTableOrNull(
+      runner, dir.path() / "000001.sst",
+      {{stratakv::RecordType::kPut, "alpha", "11111"},
+       {stratakv::RecordType::kPut, "bravo", "22222"},
+       {stratakv::RecordType::kPut, "charlie", "33333"}});
+  stratakv::CompactionInput input;
+  input.tables = {table.get()};
+  input.max_output_file_size = 30;
+  stratakv::CompactionOutput output;
+  stratakv::CompactionJob job(dir.path());
+  runner->ExpectOk(job.Run(input, &output), "run split compaction");
+  runner->Expect(output.files.size() == 3,
+                 "compaction should emit size-limited files");
 }
 
 void RejectsNullOutput(TestRunner* runner) {
@@ -121,6 +138,7 @@ void RejectsNullOutput(TestRunner* runner) {
 int main() {
   TestRunner runner;
   MergesNewestEntriesAndDropsCoveredTombstones(&runner);
+  SplitsOutputsAtConfiguredSize(&runner);
   RejectsNullOutput(&runner);
   return runner.Finish();
 }
