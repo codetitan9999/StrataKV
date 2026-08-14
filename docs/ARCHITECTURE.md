@@ -123,17 +123,26 @@ Bloom-filtered `STKV0004` format.
 
 ### Compaction
 
-`src/compaction.*` merges flushed SSTables in oldest-to-newest order. Newly
-flushed tables enter overlapping level 0. `VersionSet` counts those tables for
-the compaction trigger and validates that every level above level 0 has sorted,
-non-overlapping key ranges. The current transition strategy remains deliberately
-simple: when level 0 reaches `level0_compaction_trigger`, StrataKV compacts the
-entire active version into one level-1 replacement table, atomically installs a
-compact manifest snapshot containing the replacement, and removes obsolete
-files. This establishes durable level metadata and recovery invariants before
-selection grows to bounded overlapping inputs and multiple output files.
+`src/compaction.*` merges SSTables in oldest-to-newest order. Newly flushed
+tables enter overlapping level 0. `VersionSet` counts those tables for the
+compaction trigger and validates that every level above level 0 has sorted,
+non-overlapping key ranges. When level 0 reaches `level0_compaction_trigger`,
+StrataKV selects the oldest trigger-sized level-0 batch, computes its combined
+key range, and adds every overlapping level-1 table. Disjoint level-1 files are
+left installed. Existing level-1 inputs are merged first, followed by level-0
+inputs from oldest to newest, so the newest record deterministically wins.
 
-Because this compaction covers every active table, tombstones that only protect against older tables can be dropped from the compacted output.
+The merged key stream is partitioned into non-overlapping level-1 outputs using
+`Options::max_compaction_output_file_size` as an approximate logical-size
+target. Every output is synced and installed before one atomic manifest
+snapshot publishes the retained and replacement files together. Only selected
+inputs become obsolete, so readers pinned to either selected or retained files
+continue to observe a valid snapshot.
+
+Tombstones can be dropped because the selected range includes its complete
+older level-1 overlap and StrataKV does not yet create levels below level 1.
+Adding deeper levels will require retaining tombstones unless compaction proves
+that all older overlapping levels are covered.
 
 ### Manifest
 
@@ -232,6 +241,8 @@ Current tests cover:
 - File-sync, rename, and directory-sync ordering plus injected SSTable,
   manifest, and WAL rotation failures
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
+- Bounded level-0 selection, level-1 overlap expansion, size-limited outputs,
+  disjoint-file retention, and manifest replay of the resulting version
 
 Next test layers should add:
 
@@ -263,7 +274,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 1: Storage Skeleton Hardening
 
-- Select bounded overlapping inputs and emit multiple size-limited level files
+- Add level-1 size pressure and level-1-to-level-2 compaction
 - Add structured logging around open/recovery
 - Extend filesystem fault injection beyond WAL operations to SSTable and
   manifest reads and writes
@@ -279,7 +290,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 4: Iterators and Compaction
 
-- Add overlap-aware leveled compaction selection and level-size targets
+- Add per-level size targets and compaction scoring
 - Track read/write amplification in benchmarks
 
 ### Milestone 5: Networked Store
