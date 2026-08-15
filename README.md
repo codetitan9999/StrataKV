@@ -24,8 +24,8 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - Checksummed manifest records with atomic snapshot replacement during compaction
 - Manifest-persisted table levels with validated version-set invariants
 - Durable SSTable and manifest installation with injectable filesystem failures
-- Overlap-selected level-0/level-1 compaction with size-limited outputs and
-  obsolete-file cleanup
+- Byte-scored, overlap-selected compaction from level 0 through level 2, with
+  size-limited outputs, safe tombstone retention, and obsolete-file cleanup
 - Dependency-free unit tests
 - Local benchmark harness for throughput and latency
 
@@ -56,8 +56,9 @@ The write path is intentionally straightforward:
 6. The WAL is rotated through a recoverable renamed generation with directory
    syncs after a successful flush.
 7. When enough level-0 tables accumulate, compaction merges the oldest trigger
-   batch with only its overlapping level-1 files, emits size-limited level-1
-   tables, and atomically replaces the manifest with a compact snapshot.
+   batch with only its overlapping level-1 files and emits size-limited level-1
+   tables. If level 1 exceeds its byte target, one bounded table and its level-2
+   overlaps are compacted downward. Each edit atomically replaces the manifest.
 8. On restart, manifest-listed SSTables are loaded first, then the WAL is replayed up to the last complete record.
 
 `Options::max_wal_record_size` bounds both newly written records and recovery
@@ -93,7 +94,7 @@ docs/               architecture notes
 
 ### Phase 1: Storage Engine
 
-- Multi-level compaction and per-level size targets
+- Generalized compaction scoring and geometric size targets beyond level 2
 - More recovery and corruption tests
 - Benchmarks for writes, reads, scans, recovery, and compaction
 

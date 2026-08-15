@@ -58,6 +58,9 @@ Reads follow this order:
 3. sorted non-overlapping levels, from lower to higher level numbers
 
 Deletes are tombstones, not immediate removals from history. Compaction decides when a tombstone is safe to drop.
+An L0/L1 or L1/L2 compaction retains tombstones whenever a deeper table overlaps
+the selected key range. A tombstone is discarded only when no unselected older
+level can still contain the deleted key.
 
 Database iterators take a stable snapshot of the current source set and perform
 an incremental k-way merge using a min-heap frontier. This makes each emitted
@@ -139,10 +142,16 @@ snapshot publishes the retained and replacement files together. Only selected
 inputs become obsolete, so readers pinned to either selected or retained files
 continue to observe a valid snapshot.
 
-Tombstones can be dropped because the selected range includes its complete
-older level-1 overlap and StrataKV does not yet create levels below level 1.
-Adding deeper levels will require retaining tombstones unless compaction proves
-that all older overlapping levels are covered.
+`VersionSet` also accounts for the physical bytes in each level. When level 1
+exceeds `Options::level1_compaction_trigger_bytes`, its oldest table is selected
+with every overlapping level-2 table and rewritten as bounded level-2 outputs.
+The compaction loop can cascade an L0/L1 result directly into level 2, keeping
+the write path within both configured pressure thresholds.
+
+Tombstones are dropped only when no table below the output level overlaps the
+selected range. Otherwise they remain in the output so an unselected older
+value cannot reappear. Destination-level inputs are merged before source-level
+inputs, preserving newest-value precedence in both L0/L1 and L1/L2 jobs.
 
 ### Manifest
 
@@ -243,18 +252,20 @@ Current tests cover:
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
 - Bounded level-0 selection, level-1 overlap expansion, size-limited outputs,
   disjoint-file retention, and manifest replay of the resulting version
+- Per-level byte accounting, cascading L1/L2 overlap selection, and tombstone
+  retention in the presence of deeper overlapping data
 
 Next test layers should add:
 
-- Overlap-selected multi-level compaction with overwritten keys and tombstones
+- Compaction scoring across multiple over-budget levels
 - Fault injection around file creation, rename, and manifest updates
 
 The project starts with a tiny local harness to avoid dependency friction. Once behavior broadens, moving to GoogleTest is reasonable.
 
 ## Benchmark Strategy
 
-The current benchmark measures local `Put` performance with automatic
-compaction disabled to retain many scan sources, then reopens the database
+The current benchmark measures local `Put` performance with automatic L0/L1 and
+L1/L2 compaction enabled, then reopens the database
 and runs cold and warm random `Get` passes, an absent-key pass, plus full and
 bounded streaming scans against flushed SSTables and the final WAL tail. It
 reports throughput, latency percentiles, negative-pass block misses, SSTable
@@ -274,7 +285,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 1: Storage Skeleton Hardening
 
-- Add level-1 size pressure and level-1-to-level-2 compaction
+- Add structured compaction statistics and write-amplification accounting
 - Add structured logging around open/recovery
 - Extend filesystem fault injection beyond WAL operations to SSTable and
   manifest reads and writes
@@ -290,7 +301,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 4: Iterators and Compaction
 
-- Add per-level size targets and compaction scoring
+- Generalize geometric size targets and compaction scoring beyond level 2
 - Track read/write amplification in benchmarks
 
 ### Milestone 5: Networked Store

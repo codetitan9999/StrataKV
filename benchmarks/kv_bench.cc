@@ -71,7 +71,8 @@ int main(int argc, char** argv) {
   stratakv::Options options;
   options.write_buffer_size = 64 * 1024;
   options.block_cache_size = 8 * 1024 * 1024;
-  options.level0_compaction_trigger = 0;
+  options.level0_compaction_trigger = 4;
+  options.level1_compaction_trigger_bytes = 128 * 1024;
   auto [db, open_status] = stratakv::DB::Open(options, db_path);
   if (!open_status.ok()) {
     std::cerr << "open failed: " << open_status << '\n';
@@ -184,6 +185,8 @@ int main(int argc, char** argv) {
   std::cout << "scan merge sources: " << CountSSTables(db_path) + 1 << '\n';
   std::cout << "SSTable bytes: " << SSTableBytes(db_path) << '\n';
   std::cout << "shared block cache: " << options.block_cache_size << " bytes\n";
+  std::cout << "level-1 compaction target: "
+            << options.level1_compaction_trigger_bytes << " bytes\n";
   std::cout << "put throughput: "
             << operations / Seconds(write_duration) << " ops/sec\n";
   std::cout << "cold get throughput: "
