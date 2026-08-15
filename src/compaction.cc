@@ -14,7 +14,7 @@ Status CompactionJob::Run(const CompactionInput& input,
     return Status::InvalidArgument("compaction output must not be null");
   }
 
-  std::map<std::string, std::string> live_values;
+  std::map<std::string, TableEntry> latest_entries;
   for (const SSTableReader* table : input.tables) {
     if (table == nullptr) {
       return Status::InvalidArgument("compaction input table must not be null");
@@ -26,17 +26,18 @@ Status CompactionJob::Run(const CompactionInput& input,
     }
     for (const TableEntry& entry : entries) {
       if (entry.type == RecordType::kDelete) {
-        live_values.erase(entry.key);
+        latest_entries[entry.key] = entry;
       } else {
-        live_values[entry.key] = entry.value;
+        latest_entries[entry.key] = entry;
       }
     }
   }
 
   output->files.clear();
   std::size_t output_bytes = 0;
-  for (const auto& [key, value] : live_values) {
-    const std::size_t entry_bytes = key.size() + value.size() + 16;
+  for (const auto& [key, entry] : latest_entries) {
+    if (entry.type == RecordType::kDelete && input.drop_tombstones) continue;
+    const std::size_t entry_bytes = key.size() + entry.value.size() + 16;
     if (!output->files.empty() && !output->files.back().empty() &&
         input.max_output_file_size > 0 &&
         output_bytes + entry_bytes > input.max_output_file_size) {
@@ -44,7 +45,7 @@ Status CompactionJob::Run(const CompactionInput& input,
       output_bytes = 0;
     }
     if (output->files.empty()) output->files.emplace_back();
-    output->files.back().push_back(TableEntry{RecordType::kPut, key, value});
+    output->files.back().push_back(entry);
     output_bytes += entry_bytes;
   }
 

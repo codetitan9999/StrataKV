@@ -46,6 +46,7 @@ if(STRATAKV_BUILD_TESTS)
     tests/db_test.cc
   )
   target_link_libraries(stratakv_tests PRIVATE stratakv)
+  target_include_directories(stratakv_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
   add_test(NAME stratakv_tests COMMAND stratakv_tests)
 

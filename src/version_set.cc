@@ -61,9 +61,19 @@ std::size_t VersionSet::LevelTableCount(std::uint32_t level) const {
       }));
 }
 
+std::uint64_t VersionSet::LevelSizeBytes(std::uint32_t level) const {
+  std::uint64_t bytes = 0;
+  for (const auto& [file_number, table] : tables_) {
+    (void)file_number;
+    if (table.level == level) bytes += table.file_size_bytes;
+  }
+  return bytes;
+}
+
 VersionSet::CompactionSelection VersionSet::PickLevel0Compaction(
     std::size_t level0_input_count) const {
   CompactionSelection selection;
+  selection.output_level = 1;
   if (level0_input_count == 0) return selection;
 
   std::vector<TableMetadata> level0;
@@ -91,6 +101,9 @@ VersionSet::CompactionSelection VersionSet::PickLevel0Compaction(
     if (table.level == 1 && table.smallest_key <= selection.largest_key &&
         selection.smallest_key <= table.largest_key) {
       selection.inputs.push_back(table);
+      selection.smallest_key =
+          std::min(selection.smallest_key, table.smallest_key);
+      selection.largest_key = std::max(selection.largest_key, table.largest_key);
     }
   }
   std::sort(selection.inputs.begin(), selection.inputs.end(),
@@ -98,6 +111,66 @@ VersionSet::CompactionSelection VersionSet::PickLevel0Compaction(
               return left.smallest_key < right.smallest_key;
             });
   selection.inputs.insert(selection.inputs.end(), level0.begin(), level0.end());
+  selection.drop_tombstones = true;
+  for (const auto& [file_number, table] : tables_) {
+    (void)file_number;
+    if (table.level > selection.output_level &&
+        table.smallest_key <= selection.largest_key &&
+        selection.smallest_key <= table.largest_key) {
+      selection.drop_tombstones = false;
+      break;
+    }
+  }
+  return selection;
+}
+
+VersionSet::CompactionSelection VersionSet::PickLevelCompaction(
+    std::uint32_t level) const {
+  CompactionSelection selection;
+  if (level == 0) return selection;
+
+  std::vector<TableMetadata> source;
+  for (const auto& [file_number, table] : tables_) {
+    (void)file_number;
+    if (table.level == level) source.push_back(table);
+  }
+  if (source.empty()) return selection;
+  std::sort(source.begin(), source.end(), [](const auto& left, const auto& right) {
+    return left.file_number < right.file_number;
+  });
+
+  const TableMetadata& picked = source.front();
+  selection.smallest_key = picked.smallest_key;
+  selection.largest_key = picked.largest_key;
+  selection.output_level = level + 1;
+
+  for (const auto& [file_number, table] : tables_) {
+    (void)file_number;
+    if (table.level == selection.output_level &&
+        table.smallest_key <= selection.largest_key &&
+        selection.smallest_key <= table.largest_key) {
+      selection.inputs.push_back(table);
+      selection.smallest_key =
+          std::min(selection.smallest_key, table.smallest_key);
+      selection.largest_key = std::max(selection.largest_key, table.largest_key);
+    }
+  }
+  std::sort(selection.inputs.begin(), selection.inputs.end(),
+            [](const auto& left, const auto& right) {
+              return left.smallest_key < right.smallest_key;
+            });
+  selection.inputs.push_back(picked);
+
+  selection.drop_tombstones = true;
+  for (const auto& [file_number, table] : tables_) {
+    (void)file_number;
+    if (table.level > selection.output_level &&
+        table.smallest_key <= selection.largest_key &&
+        selection.smallest_key <= table.largest_key) {
+      selection.drop_tombstones = false;
+      break;
+    }
+  }
   return selection;
 }
 

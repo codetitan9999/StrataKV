@@ -413,22 +413,29 @@ class DBImpl final : public DB {
   }
 
   Status MaybeCompactTables() {
-    if (options_.level0_compaction_trigger == 0 ||
-        version_set_.LevelTableCount(0) < options_.level0_compaction_trigger ||
-        tables_.size() < 2) {
-      return Status::OK();
+    while (true) {
+      VersionSet::CompactionSelection selection;
+      if (options_.level0_compaction_trigger > 0 &&
+          version_set_.LevelTableCount(0) >= options_.level0_compaction_trigger) {
+        selection = version_set_.PickLevel0Compaction(
+            options_.level0_compaction_trigger);
+      } else if (options_.level1_compaction_trigger_bytes > 0 &&
+                 version_set_.LevelSizeBytes(1) >
+                     options_.level1_compaction_trigger_bytes) {
+        selection = version_set_.PickLevelCompaction(1);
+      } else {
+        return Status::OK();
+      }
+      if (selection.inputs.empty()) return Status::OK();
+      Status status = CompactTables(selection);
+      if (!status.ok()) return status;
     }
-
-    return CompactTables();
   }
 
-  Status CompactTables() {
-    const VersionSet::CompactionSelection selection =
-        version_set_.PickLevel0Compaction(options_.level0_compaction_trigger);
-    if (selection.inputs.empty()) return Status::OK();
-
+  Status CompactTables(const VersionSet::CompactionSelection& selection) {
     CompactionInput input;
     input.max_output_file_size = options_.max_compaction_output_file_size;
+    input.drop_tombstones = selection.drop_tombstones;
     input.tables.reserve(selection.inputs.size());
     for (const TableMetadata& metadata : selection.inputs) {
       const auto it = std::find_if(
@@ -482,7 +489,7 @@ class DBImpl final : public DB {
         return finish_status;
       }
       metadata.file_number = file_number;
-      metadata.level = 1;
+      metadata.level = selection.output_level;
       metadata.file_path = final_path;
 
       Status install_status = file_system_->SyncFile(temporary_path);
@@ -504,7 +511,8 @@ class DBImpl final : public DB {
         return open_status;
       }
 
-      next_tables.push_back(TableState{file_number, 1, std::move(reader)});
+      next_tables.push_back(
+          TableState{file_number, selection.output_level, std::move(reader)});
     }
 
     std::vector<TableMetadata> manifest_snapshot;

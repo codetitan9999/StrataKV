@@ -12,6 +12,7 @@ namespace stratakv {
 struct CompactionInput {
   std::vector<const SSTableReader*> tables;
   std::size_t max_output_file_size = 0;
+  bool drop_tombstones = true;
 };
 
 struct CompactionOutput {

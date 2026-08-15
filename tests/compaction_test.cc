@@ -126,6 +126,22 @@ void SplitsOutputsAtConfiguredSize(TestRunner* runner) {
                  "compaction should emit size-limited files");
 }
 
+void RetainsTombstonesForDeeperLevels(TestRunner* runner) {
+  TempDir dir;
+  auto table = BuildTableOrNull(
+      runner, dir.path() / "000001.sst",
+      {{stratakv::RecordType::kDelete, "alpha", ""}});
+  stratakv::CompactionInput input;
+  input.tables = {table.get()};
+  input.drop_tombstones = false;
+  stratakv::CompactionOutput output;
+  stratakv::CompactionJob job(dir.path());
+  runner->ExpectOk(job.Run(input, &output), "run tombstone compaction");
+  runner->Expect(output.files.size() == 1 && output.files[0].size() == 1 &&
+                     output.files[0][0].type == stratakv::RecordType::kDelete,
+                 "compaction should retain tombstone when requested");
+}
+
 void RejectsNullOutput(TestRunner* runner) {
   stratakv::CompactionJob job(std::filesystem::temp_directory_path());
   const stratakv::Status status = job.Run(stratakv::CompactionInput{}, nullptr);
@@ -139,6 +155,7 @@ int main() {
   TestRunner runner;
   MergesNewestEntriesAndDropsCoveredTombstones(&runner);
   SplitsOutputsAtConfiguredSize(&runner);
+  RetainsTombstonesForDeeperLevels(&runner);
   RejectsNullOutput(&runner);
   return runner.Finish();
 }

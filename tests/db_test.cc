@@ -1,6 +1,8 @@
 #include "stratakv/db.h"
 #include "stratakv/file_system.h"
 
+#include "manifest.h"
+
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -148,6 +150,20 @@ int CountSSTables(const std::filesystem::path& db_path) {
     }
   }
   return count;
+}
+
+std::vector<std::uint32_t> ManifestLevels(const std::filesystem::path& db_path) {
+  std::vector<std::uint32_t> levels;
+  stratakv::ManifestReader reader(db_path / "MANIFEST");
+  const stratakv::Status status = reader.Replay(
+      [&](const stratakv::ManifestEdit& edit) {
+        if (edit.type == stratakv::ManifestEditType::kTableAdded) {
+          levels.push_back(edit.table.level);
+        }
+        return stratakv::Status::OK();
+      });
+  if (!status.ok()) return {};
+  return levels;
 }
 
 void ReportsSSTableInstallFailureBeforeManifestEdit(TestRunner* runner) {
@@ -733,6 +749,43 @@ void IteratorSurvivesCompactionCleanup(TestRunner* runner) {
                  "obsolete tables should be removed after iterator release");
 }
 
+void CascadesLevelOneCompactionIntoLevelTwo(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.level0_compaction_trigger = 3;
+  options.level1_compaction_trigger_bytes = 1;
+
+  auto db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "alpha", "one"),
+                   "put alpha before level cascade");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "bravo", "two"),
+                   "put bravo before level cascade");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "charlie", "three"),
+                   "trigger level-one cascade");
+  runner->Expect(ManifestLevels(dir.path()) == std::vector<std::uint32_t>({2}),
+                 "oversized level one should compact into level two");
+
+  runner->ExpectOk(db->Delete(stratakv::WriteOptions{}, "alpha"),
+                   "delete key stored in level two");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "delta", "four"),
+                   "add second cascade input");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "echo", "five"),
+                   "trigger overlapping level-two compaction");
+  auto [value, status] = db->Get(stratakv::ReadOptions{}, "alpha");
+  (void)value;
+  runner->Expect(status.code() == stratakv::Status::Code::kNotFound,
+                 "cascaded compaction should preserve deletion semantics");
+
+  db.reset();
+  db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+  std::tie(value, status) = db->Get(stratakv::ReadOptions{}, "alpha");
+  runner->Expect(status.code() == stratakv::Status::Code::kNotFound,
+                 "level-two deletion should survive reopen");
+}
+
 }  // namespace
 
 int main() {
@@ -755,5 +808,6 @@ int main() {
   CompactionDropsCoveredTombstones(&runner);
   CompactionSplitsOutputsAndRetainsDisjointLevelFiles(&runner);
   IteratorSurvivesCompactionCleanup(&runner);
+  CascadesLevelOneCompactionIntoLevelTwo(&runner);
   return runner.Finish();
 }
