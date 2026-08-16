@@ -2,6 +2,7 @@
 #include "stratakv/file_system.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <iomanip>
@@ -265,6 +266,11 @@ class DBImpl final : public DB {
     return block_cache_->stats();
   }
 
+  CompactionStats GetCompactionStats() const override {
+    std::lock_guard<std::mutex> lock(mu_);
+    return compaction_stats_;
+  }
+
  private:
   struct TableState {
     std::uint64_t file_number = 0;
@@ -433,11 +439,14 @@ class DBImpl final : public DB {
   }
 
   Status CompactTables(const VersionSet::CompactionSelection& selection) {
+    const auto compaction_start = std::chrono::steady_clock::now();
+    std::uint64_t input_bytes = 0;
     CompactionInput input;
     input.max_output_file_size = options_.max_compaction_output_file_size;
     input.drop_tombstones = selection.drop_tombstones;
     input.tables.reserve(selection.inputs.size());
     for (const TableMetadata& metadata : selection.inputs) {
+      input_bytes += metadata.file_size_bytes;
       const auto it = std::find_if(
           tables_.begin(), tables_.end(), [&](const TableState& table) {
             return table.file_number == metadata.file_number;
@@ -456,6 +465,7 @@ class DBImpl final : public DB {
     }
 
     std::vector<TableState> next_tables;
+    std::uint64_t output_bytes = 0;
     for (const TableState& table : tables_) {
       const bool selected = std::any_of(
           selection.inputs.begin(), selection.inputs.end(),
@@ -491,6 +501,7 @@ class DBImpl final : public DB {
       metadata.file_number = file_number;
       metadata.level = selection.output_level;
       metadata.file_path = final_path;
+      output_bytes += metadata.file_size_bytes;
 
       Status install_status = file_system_->SyncFile(temporary_path);
       if (!install_status.ok()) {
@@ -549,6 +560,15 @@ class DBImpl final : public DB {
         return version_status;
       }
     }
+    ++compaction_stats_.jobs;
+    compaction_stats_.input_files += selection.inputs.size();
+    compaction_stats_.output_files += output.files.size();
+    compaction_stats_.bytes_read += input_bytes;
+    compaction_stats_.bytes_written += output_bytes;
+    compaction_stats_.elapsed_nanoseconds +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - compaction_start)
+            .count();
     return Status::OK();
   }
 
@@ -627,6 +647,7 @@ class DBImpl final : public DB {
   std::unique_ptr<WalWriter> wal_;
   std::shared_ptr<FileSystem> file_system_;
   std::shared_ptr<BlockCache> block_cache_;
+  CompactionStats compaction_stats_;
 };
 
 std::pair<std::unique_ptr<DB>, Status> DB::Open(const Options& options,

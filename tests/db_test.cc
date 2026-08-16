@@ -766,6 +766,17 @@ void CascadesLevelOneCompactionIntoLevelTwo(TestRunner* runner) {
                    "trigger level-one cascade");
   runner->Expect(ManifestLevels(dir.path()) == std::vector<std::uint32_t>({2}),
                  "oversized level one should compact into level two");
+  const stratakv::CompactionStats first_stats = db->GetCompactionStats();
+  runner->Expect(first_stats.jobs == 2,
+                 "level cascade should report both compaction jobs");
+  runner->Expect(first_stats.input_files == 4,
+                 "level cascade should count all input files");
+  runner->Expect(first_stats.output_files == 2,
+                 "level cascade should count both output files");
+  runner->Expect(first_stats.bytes_read > 0 && first_stats.bytes_written > 0,
+                 "level cascade should report physical byte traffic");
+  runner->Expect(first_stats.elapsed_nanoseconds > 0,
+                 "level cascade should report elapsed time");
 
   runner->ExpectOk(db->Delete(stratakv::WriteOptions{}, "alpha"),
                    "delete key stored in level two");

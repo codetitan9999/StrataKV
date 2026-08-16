@@ -89,6 +89,7 @@ int main(int argc, char** argv) {
     }
   }
   const auto write_duration = Clock::now() - write_start;
+  const auto compaction_stats = db->GetCompactionStats();
 
   db.reset();
   std::tie(db, open_status) = stratakv::DB::Open(options, db_path);
@@ -187,6 +188,25 @@ int main(int argc, char** argv) {
   std::cout << "shared block cache: " << options.block_cache_size << " bytes\n";
   std::cout << "level-1 compaction target: "
             << options.level1_compaction_trigger_bytes << " bytes\n";
+  std::uint64_t logical_write_bytes = 0;
+  for (std::size_t i = 0; i < operations; ++i) {
+    logical_write_bytes += KeyFor(i).size() + ValueFor(i).size();
+  }
+  const double compaction_write_amplification =
+      logical_write_bytes == 0
+          ? 0.0
+          : static_cast<double>(compaction_stats.bytes_written) /
+                static_cast<double>(logical_write_bytes);
+  std::cout << "compaction jobs/input files/output files: "
+            << compaction_stats.jobs << "/" << compaction_stats.input_files
+            << "/" << compaction_stats.output_files << '\n';
+  std::cout << "compaction bytes read/written: "
+            << compaction_stats.bytes_read << "/"
+            << compaction_stats.bytes_written << '\n';
+  std::cout << "compaction elapsed: "
+            << compaction_stats.elapsed_nanoseconds / 1000000.0 << " ms\n";
+  std::cout << "compaction write amplification: "
+            << compaction_write_amplification << "x\n";
   std::cout << "put throughput: "
             << operations / Seconds(write_duration) << " ops/sec\n";
   std::cout << "cold get throughput: "

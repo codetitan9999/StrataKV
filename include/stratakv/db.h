@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "stratakv/block_cache.h"
+#include "stratakv/compaction_stats.h"
 #include "stratakv/iterator.h"
 #include "stratakv/options.h"
 #include "stratakv/status.h"
@@ -30,6 +31,7 @@ class DB {
   [[nodiscard]] virtual std::unique_ptr<Iterator> NewIterator(
       const ReadOptions& options) const = 0;
   [[nodiscard]] virtual BlockCacheStats GetBlockCacheStats() const = 0;
+  [[nodiscard]] virtual CompactionStats GetCompactionStats() const = 0;
 };
 
 }  // namespace stratakv
