@@ -26,6 +26,8 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - Durable SSTable and manifest installation with injectable filesystem failures
 - Byte-scored, overlap-selected compaction from level 0 through level 2, with
   size-limited outputs, safe tombstone retention, and obsolete-file cleanup
+- Cumulative compaction metrics for jobs, file counts, physical bytes, elapsed
+  time, and benchmark write amplification
 - Dependency-free unit tests
 - Local benchmark harness for throughput and latency
 

@@ -153,6 +153,13 @@ selected range. Otherwise they remain in the output so an unselected older
 value cannot reappear. Destination-level inputs are merged before source-level
 inputs, preserving newest-value precedence in both L0/L1 and L1/L2 jobs.
 
+Successful compactions contribute to database-wide `CompactionStats`: job,
+input-file, output-file, physical bytes-read, physical bytes-written, and
+elapsed-time counters. Failed jobs are not published as completed work. The
+benchmark captures these counters before reopen and reports compaction write
+amplification as physical compaction output bytes divided by logical key/value
+bytes inserted.
+
 ### Manifest
 
 `src/manifest.*` stores checksummed table metadata records, including each
@@ -285,7 +292,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 1: Storage Skeleton Hardening
 
-- Add structured compaction statistics and write-amplification accounting
+- Generalize compaction scoring and geometric targets beyond level 2
 - Add structured logging around open/recovery
 - Extend filesystem fault injection beyond WAL operations to SSTable and
   manifest reads and writes
