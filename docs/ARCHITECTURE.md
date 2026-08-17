@@ -142,16 +142,19 @@ snapshot publishes the retained and replacement files together. Only selected
 inputs become obsolete, so readers pinned to either selected or retained files
 continue to observe a valid snapshot.
 
-`VersionSet` also accounts for the physical bytes in each level. When level 1
-exceeds `Options::level1_compaction_trigger_bytes`, its oldest table is selected
-with every overlapping level-2 table and rewritten as bounded level-2 outputs.
-The compaction loop can cascade an L0/L1 result directly into level 2, keeping
-the write path within both configured pressure thresholds.
+`VersionSet` also accounts for the physical bytes in each level. Level 1 uses
+`Options::level1_compaction_trigger_bytes` as its target, and each subsequent
+level target grows by `Options::level_compaction_size_multiplier`. Every sorted
+level below `Options::max_compaction_level` is scored as physical bytes divided
+by its target. The most over-budget level selects its oldest table with every
+overlapping table in the next level and rewrites them as bounded outputs. The
+compaction loop can therefore cascade an L0/L1 result through multiple levels
+while stopping at the configured maximum level.
 
 Tombstones are dropped only when no table below the output level overlaps the
 selected range. Otherwise they remain in the output so an unselected older
 value cannot reappear. Destination-level inputs are merged before source-level
-inputs, preserving newest-value precedence in both L0/L1 and L1/L2 jobs.
+inputs, preserving newest-value precedence for every adjacent-level job.
 
 Successful compactions contribute to database-wide `CompactionStats`: job,
 input-file, output-file, physical bytes-read, physical bytes-written, and
@@ -259,20 +262,18 @@ Current tests cover:
 - Compaction merging, tombstone handling, obsolete-file cleanup, and reopen from compacted state
 - Bounded level-0 selection, level-1 overlap expansion, size-limited outputs,
   disjoint-file retention, and manifest replay of the resulting version
-- Per-level byte accounting, cascading L1/L2 overlap selection, and tombstone
-  retention in the presence of deeper overlapping data
+- Per-level byte accounting, geometric compaction scoring, deep adjacent-level
+  cascades, and tombstone retention in the presence of deeper overlapping data
 
-Next test layers should add:
-
-- Compaction scoring across multiple over-budget levels
-- Fault injection around file creation, rename, and manifest updates
+Next test layers should add fault injection around file creation, rename, and
+manifest updates, plus compaction scheduling fairness under sustained writes.
 
 The project starts with a tiny local harness to avoid dependency friction. Once behavior broadens, moving to GoogleTest is reasonable.
 
 ## Benchmark Strategy
 
-The current benchmark measures local `Put` performance with automatic L0/L1 and
-L1/L2 compaction enabled, then reopens the database
+The current benchmark measures local `Put` performance with automatic L0 and
+geometrically scored sorted-level compaction enabled, then reopens the database
 and runs cold and warm random `Get` passes, an absent-key pass, plus full and
 bounded streaming scans against flushed SSTables and the final WAL tail. It
 reports throughput, latency percentiles, negative-pass block misses, SSTable
@@ -292,7 +293,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 1: Storage Skeleton Hardening
 
-- Generalize compaction scoring and geometric targets beyond level 2
+- Add per-level compaction work metrics and scheduling fairness
 - Add structured logging around open/recovery
 - Extend filesystem fault injection beyond WAL operations to SSTable and
   manifest reads and writes
@@ -308,7 +309,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 4: Iterators and Compaction
 
-- Generalize geometric size targets and compaction scoring beyond level 2
+- Add compaction scheduling fairness under sustained write pressure
 - Track read/write amplification in benchmarks
 
 ### Milestone 5: Networked Store
