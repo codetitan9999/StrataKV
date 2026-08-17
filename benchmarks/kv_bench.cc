@@ -73,6 +73,8 @@ int main(int argc, char** argv) {
   options.block_cache_size = 8 * 1024 * 1024;
   options.level0_compaction_trigger = 4;
   options.level1_compaction_trigger_bytes = 128 * 1024;
+  options.level_compaction_size_multiplier = 4;
+  options.max_compaction_level = 6;
   auto [db, open_status] = stratakv::DB::Open(options, db_path);
   if (!open_status.ok()) {
     std::cerr << "open failed: " << open_status << '\n';
@@ -188,6 +190,9 @@ int main(int argc, char** argv) {
   std::cout << "shared block cache: " << options.block_cache_size << " bytes\n";
   std::cout << "level-1 compaction target: "
             << options.level1_compaction_trigger_bytes << " bytes\n";
+  std::cout << "level size multiplier/max level: "
+            << options.level_compaction_size_multiplier << "/"
+            << options.max_compaction_level << '\n';
   std::uint64_t logical_write_bytes = 0;
   for (std::size_t i = 0; i < operations; ++i) {
     logical_write_bytes += KeyFor(i).size() + ValueFor(i).size();

@@ -755,6 +755,7 @@ void CascadesLevelOneCompactionIntoLevelTwo(TestRunner* runner) {
   options.write_buffer_size = 1;
   options.level0_compaction_trigger = 3;
   options.level1_compaction_trigger_bytes = 1;
+  options.max_compaction_level = 2;
 
   auto db = OpenOrFail(runner, dir.path(), options);
   if (!db) return;
@@ -797,6 +798,39 @@ void CascadesLevelOneCompactionIntoLevelTwo(TestRunner* runner) {
                  "level-two deletion should survive reopen");
 }
 
+void CascadesCompactionThroughGeometricLevels(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.level0_compaction_trigger = 3;
+  options.level1_compaction_trigger_bytes = 1;
+  options.level_compaction_size_multiplier = 2;
+  options.max_compaction_level = 4;
+
+  auto db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "alpha", "one"),
+                   "put alpha before deep cascade");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "bravo", "two"),
+                   "put bravo before deep cascade");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "charlie", "three"),
+                   "trigger deep cascade");
+  runner->Expect(ManifestLevels(dir.path()) == std::vector<std::uint32_t>({4}),
+                 "geometric targets should cascade output to the maximum level");
+  runner->Expect(db->GetCompactionStats().jobs == 4,
+                 "deep cascade should account for every level transition");
+
+  auto [value, status] = db->Get(stratakv::ReadOptions{}, "bravo");
+  runner->ExpectOk(status, "read value after deep cascade");
+  runner->Expect(value == "two", "deep cascade should preserve values");
+  db.reset();
+  db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+  std::tie(value, status) = db->Get(stratakv::ReadOptions{}, "bravo");
+  runner->ExpectOk(status, "read deep-level value after reopen");
+  runner->Expect(value == "two", "deep-level value should survive reopen");
+}
+
 }  // namespace
 
 int main() {
@@ -820,5 +854,6 @@ int main() {
   CompactionSplitsOutputsAndRetainsDisjointLevelFiles(&runner);
   IteratorSurvivesCompactionCleanup(&runner);
   CascadesLevelOneCompactionIntoLevelTwo(&runner);
+  CascadesCompactionThroughGeometricLevels(&runner);
   return runner.Finish();
 }

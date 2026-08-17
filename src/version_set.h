@@ -26,6 +26,9 @@ class VersionSet {
   [[nodiscard]] std::vector<TableMetadata> TablesInManifestOrder() const;
   [[nodiscard]] std::size_t LevelTableCount(std::uint32_t level) const;
   [[nodiscard]] std::uint64_t LevelSizeBytes(std::uint32_t level) const;
+  [[nodiscard]] std::uint32_t PickCompactionLevel(
+      std::uint64_t level1_target_bytes, std::uint32_t size_multiplier,
+      std::uint32_t max_output_level) const;
   [[nodiscard]] CompactionSelection PickLevel0Compaction(
       std::size_t level0_input_count) const;
   [[nodiscard]] CompactionSelection PickLevelCompaction(

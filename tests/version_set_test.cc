@@ -51,6 +51,18 @@ int main() {
   expect(version.LevelSizeBytes(1) == 200,
          "sorted-level bytes should be tracked");
 
+  stratakv::VersionSet scored;
+  expect(scored.AddTable(Table(40, 1, "a", "b", 150)).ok(),
+         "add over-budget level one");
+  expect(scored.AddTable(Table(41, 2, "c", "d", 2500)).ok(),
+         "add more-over-budget level two");
+  expect(scored.PickCompactionLevel(100, 10, 4) == 2,
+         "highest compaction score should win across sorted levels");
+  expect(scored.PickCompactionLevel(100, 10, 2) == 1,
+         "maximum output level should bound scoring");
+  expect(scored.PickCompactionLevel(0, 10, 4) == 0,
+         "zero base target should disable sorted-level compaction");
+
   const auto selection = version.PickLevel0Compaction(1);
   numbers.clear();
   for (const auto& table : selection.inputs) numbers.push_back(table.file_number);

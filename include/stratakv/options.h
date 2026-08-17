@@ -32,9 +32,17 @@ struct Options {
   // A value of 0 emits a single output table.
   std::size_t max_compaction_output_file_size = 2 * 1024 * 1024;
 
-  // Compact level 1 into level 2 when its total on-disk bytes exceed this
-  // target. A value of 0 disables level-1 compaction.
+  // Base byte target for sorted-level compaction. A value of 0 disables it.
   std::uint64_t level1_compaction_trigger_bytes = 16 * 1024 * 1024;
+
+  // Each subsequent sorted level is this many times larger than the previous
+  // level. Values below 2 are treated as 2.
+  std::uint32_t level_compaction_size_multiplier = 10;
+
+  // Highest level that may receive compaction output. Sorted levels below it
+  // are scored against their geometric byte targets. Values below 2 disable
+  // sorted-level compaction.
+  std::uint32_t max_compaction_level = 6;
 
   // Durably sync the WAL file after each write.
   bool fsync_wal = false;

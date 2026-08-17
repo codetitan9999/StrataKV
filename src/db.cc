@@ -425,12 +425,13 @@ class DBImpl final : public DB {
           version_set_.LevelTableCount(0) >= options_.level0_compaction_trigger) {
         selection = version_set_.PickLevel0Compaction(
             options_.level0_compaction_trigger);
-      } else if (options_.level1_compaction_trigger_bytes > 0 &&
-                 version_set_.LevelSizeBytes(1) >
-                     options_.level1_compaction_trigger_bytes) {
-        selection = version_set_.PickLevelCompaction(1);
       } else {
-        return Status::OK();
+        const std::uint32_t level = version_set_.PickCompactionLevel(
+            options_.level1_compaction_trigger_bytes,
+            options_.level_compaction_size_multiplier,
+            options_.max_compaction_level);
+        if (level == 0) return Status::OK();
+        selection = version_set_.PickLevelCompaction(level);
       }
       if (selection.inputs.empty()) return Status::OK();
       Status status = CompactTables(selection);

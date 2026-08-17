@@ -1,6 +1,7 @@
 #include "version_set.h"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace stratakv {
@@ -68,6 +69,30 @@ std::uint64_t VersionSet::LevelSizeBytes(std::uint32_t level) const {
     if (table.level == level) bytes += table.file_size_bytes;
   }
   return bytes;
+}
+
+std::uint32_t VersionSet::PickCompactionLevel(
+    std::uint64_t level1_target_bytes, std::uint32_t size_multiplier,
+    std::uint32_t max_output_level) const {
+  if (level1_target_bytes == 0 || max_output_level < 2) return 0;
+  const std::uint64_t multiplier = std::max<std::uint32_t>(2, size_multiplier);
+  std::uint32_t best_level = 0;
+  long double best_score = 1.0L;
+  std::uint64_t target = level1_target_bytes;
+  for (std::uint32_t level = 1; level < max_output_level; ++level) {
+    const long double score =
+        static_cast<long double>(LevelSizeBytes(level)) / target;
+    if (score > best_score) {
+      best_score = score;
+      best_level = level;
+    }
+    if (target > std::numeric_limits<std::uint64_t>::max() / multiplier) {
+      target = std::numeric_limits<std::uint64_t>::max();
+    } else {
+      target *= multiplier;
+    }
+  }
+  return best_level;
 }
 
 VersionSet::CompactionSelection VersionSet::PickLevel0Compaction(
