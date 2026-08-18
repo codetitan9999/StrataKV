@@ -151,6 +151,11 @@ overlapping table in the next level and rewrites them as bounded outputs. The
 compaction loop can therefore cascade an L0/L1 result through multiple levels
 while stopping at the configured maximum level.
 
+Level-0 readiness and sorted-level scores are evaluated together on every
+scheduler pass. If both have eligible work, the scheduler alternates between
+them. This retains prompt level-0 relief without allowing a flush backlog to
+indefinitely postpone already over-budget deeper levels.
+
 Tombstones are dropped only when no table below the output level overlaps the
 selected range. Otherwise they remain in the output so an unselected older
 value cannot reappear. Destination-level inputs are merged before source-level
@@ -159,9 +164,11 @@ inputs, preserving newest-value precedence for every adjacent-level job.
 Successful compactions contribute to database-wide `CompactionStats`: job,
 input-file, output-file, physical bytes-read, physical bytes-written, and
 elapsed-time counters. Failed jobs are not published as completed work. The
-benchmark captures these counters before reopen and reports compaction write
-amplification as physical compaction output bytes divided by logical key/value
-bytes inserted.
+same counters are attributed to each source/output level transition, making
+scheduler service and amplification visible for `L0->L1`, `L1->L2`, and deeper
+work independently. The benchmark captures these counters before reopen and
+reports compaction write amplification as physical compaction output bytes
+divided by logical key/value bytes inserted.
 
 ### Manifest
 
@@ -264,9 +271,10 @@ Current tests cover:
   disjoint-file retention, and manifest replay of the resulting version
 - Per-level byte accounting, geometric compaction scoring, deep adjacent-level
   cascades, and tombstone retention in the presence of deeper overlapping data
+- Per-transition work accounting across deep compaction cascades
 
-Next test layers should add fault injection around file creation, rename, and
-manifest updates, plus compaction scheduling fairness under sustained writes.
+Next test layers should add broader crash-point matrices around file creation,
+rename, and manifest updates, plus long-running mixed read/write workloads.
 
 The project starts with a tiny local harness to avoid dependency friction. Once behavior broadens, moving to GoogleTest is reasonable.
 
@@ -293,7 +301,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 1: Storage Skeleton Hardening
 
-- Add per-level compaction work metrics and scheduling fairness
+- Add background compaction execution and write-rate smoothing
 - Add structured logging around open/recovery
 - Extend filesystem fault injection beyond WAL operations to SSTable and
   manifest reads and writes
@@ -309,7 +317,7 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 4: Iterators and Compaction
 
-- Add compaction scheduling fairness under sustained write pressure
+- Add background compaction and write stalls under sustained pressure
 - Track read/write amplification in benchmarks
 
 ### Milestone 5: Networked Store

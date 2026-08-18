@@ -26,8 +26,9 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - Durable SSTable and manifest installation with injectable filesystem failures
 - Byte-scored, overlap-selected compaction through configurable sorted levels, with
   size-limited outputs, safe tombstone retention, and obsolete-file cleanup
-- Cumulative compaction metrics for jobs, file counts, physical bytes, elapsed
-  time, and benchmark write amplification
+- Fair compaction scheduling between level 0 and scored sorted levels
+- Cumulative and per-level compaction metrics for jobs, file counts, physical
+  bytes, elapsed time, and benchmark write amplification
 - Dependency-free unit tests
 - Local benchmark harness for throughput and latency
 
@@ -61,7 +62,9 @@ The write path is intentionally straightforward:
    batch with only its overlapping level-1 files and emits size-limited level-1
    tables. Sorted levels are scored against geometric byte targets; the most
    over-budget level compacts one bounded table with all overlaps in the next
-   level. Each edit atomically replaces the manifest.
+   level. When both paths are ready, scheduling alternates between level 0 and
+   sorted-level work so flush pressure cannot starve deeper levels. Each edit
+   atomically replaces the manifest.
 8. On restart, manifest-listed SSTables are loaded first, then the WAL is replayed up to the last complete record.
 
 `Options::max_wal_record_size` bounds both newly written records and recovery
@@ -97,7 +100,6 @@ docs/               architecture notes
 
 ### Phase 1: Storage Engine
 
-- Compaction scheduling fairness and per-level work metrics
 - More recovery and corruption tests
 - Benchmarks for writes, reads, scans, recovery, and compaction
 
