@@ -420,18 +420,23 @@ class DBImpl final : public DB {
 
   Status MaybeCompactTables() {
     while (true) {
+      const bool level0_ready = options_.level0_compaction_trigger > 0 &&
+          version_set_.LevelTableCount(0) >= options_.level0_compaction_trigger;
+      const std::uint32_t sorted_level = version_set_.PickCompactionLevel(
+          options_.level1_compaction_trigger_bytes,
+          options_.level_compaction_size_multiplier,
+          options_.max_compaction_level);
+      const bool sorted_ready = sorted_level != 0;
+      if (!level0_ready && !sorted_ready) return Status::OK();
+
       VersionSet::CompactionSelection selection;
-      if (options_.level0_compaction_trigger > 0 &&
-          version_set_.LevelTableCount(0) >= options_.level0_compaction_trigger) {
+      if (sorted_ready && (!level0_ready || prefer_sorted_compaction_)) {
+        selection = version_set_.PickLevelCompaction(sorted_level);
+        if (level0_ready) prefer_sorted_compaction_ = false;
+      } else {
         selection = version_set_.PickLevel0Compaction(
             options_.level0_compaction_trigger);
-      } else {
-        const std::uint32_t level = version_set_.PickCompactionLevel(
-            options_.level1_compaction_trigger_bytes,
-            options_.level_compaction_size_multiplier,
-            options_.max_compaction_level);
-        if (level == 0) return Status::OK();
-        selection = version_set_.PickLevelCompaction(level);
+        if (sorted_ready) prefer_sorted_compaction_ = true;
       }
       if (selection.inputs.empty()) return Status::OK();
       Status status = CompactTables(selection);
@@ -561,17 +566,37 @@ class DBImpl final : public DB {
         return version_status;
       }
     }
+    const std::uint64_t elapsed_nanoseconds =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - compaction_start)
+            .count();
     ++compaction_stats_.jobs;
     compaction_stats_.input_files += selection.inputs.size();
     compaction_stats_.output_files += output.files.size();
     compaction_stats_.bytes_read += input_bytes;
     compaction_stats_.bytes_written += output_bytes;
-    compaction_stats_.elapsed_nanoseconds +=
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - compaction_start)
-            .count();
+    compaction_stats_.elapsed_nanoseconds += elapsed_nanoseconds;
+    auto level_stats = std::find_if(
+        compaction_stats_.levels.begin(), compaction_stats_.levels.end(),
+        [&](const CompactionLevelStats& stats) {
+          return stats.input_level == selection.input_level &&
+                 stats.output_level == selection.output_level;
+        });
+    if (level_stats == compaction_stats_.levels.end()) {
+      compaction_stats_.levels.push_back(CompactionLevelStats{
+          selection.input_level, selection.output_level});
+      level_stats = std::prev(compaction_stats_.levels.end());
+    }
+    ++level_stats->jobs;
+    level_stats->input_files += selection.inputs.size();
+    level_stats->output_files += output.files.size();
+    level_stats->bytes_read += input_bytes;
+    level_stats->bytes_written += output_bytes;
+    level_stats->elapsed_nanoseconds += elapsed_nanoseconds;
     return Status::OK();
   }
+
+  bool prefer_sorted_compaction_ = false;
 
   void SortTablesForReads() {
     std::sort(tables_.begin(), tables_.end(),

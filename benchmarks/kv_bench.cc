@@ -210,6 +210,12 @@ int main(int argc, char** argv) {
             << compaction_stats.bytes_written << '\n';
   std::cout << "compaction elapsed: "
             << compaction_stats.elapsed_nanoseconds / 1000000.0 << " ms\n";
+  for (const auto& level : compaction_stats.levels) {
+    std::cout << "compaction L" << level.input_level << "->L"
+              << level.output_level << " jobs/read/write bytes: "
+              << level.jobs << "/" << level.bytes_read << "/"
+              << level.bytes_written << '\n';
+  }
   std::cout << "compaction write amplification: "
             << compaction_write_amplification << "x\n";
   std::cout << "put throughput: "

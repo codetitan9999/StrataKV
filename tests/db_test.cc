@@ -778,6 +778,18 @@ void CascadesLevelOneCompactionIntoLevelTwo(TestRunner* runner) {
                  "level cascade should report physical byte traffic");
   runner->Expect(first_stats.elapsed_nanoseconds > 0,
                  "level cascade should report elapsed time");
+  runner->Expect(first_stats.levels.size() == 2,
+                 "level cascade should report both level transitions");
+  if (first_stats.levels.size() == 2) {
+    runner->Expect(first_stats.levels[0].input_level == 0 &&
+                       first_stats.levels[0].output_level == 1 &&
+                       first_stats.levels[0].jobs == 1,
+                   "level-zero work should be attributed to level one");
+    runner->Expect(first_stats.levels[1].input_level == 1 &&
+                       first_stats.levels[1].output_level == 2 &&
+                       first_stats.levels[1].jobs == 1,
+                   "level-one work should be attributed to level two");
+  }
 
   runner->ExpectOk(db->Delete(stratakv::WriteOptions{}, "alpha"),
                    "delete key stored in level two");
@@ -819,6 +831,17 @@ void CascadesCompactionThroughGeometricLevels(TestRunner* runner) {
                  "geometric targets should cascade output to the maximum level");
   runner->Expect(db->GetCompactionStats().jobs == 4,
                  "deep cascade should account for every level transition");
+  const auto stats = db->GetCompactionStats();
+  runner->Expect(stats.levels.size() == 4,
+                 "deep cascade should expose work for every source level");
+  for (std::size_t level = 0; level < stats.levels.size(); ++level) {
+    runner->Expect(stats.levels[level].input_level == level &&
+                       stats.levels[level].output_level == level + 1 &&
+                       stats.levels[level].jobs == 1 &&
+                       stats.levels[level].bytes_read > 0 &&
+                       stats.levels[level].bytes_written > 0,
+                   "deep cascade level metrics should be complete");
+  }
 
   auto [value, status] = db->Get(stratakv::ReadOptions{}, "bravo");
   runner->ExpectOk(status, "read value after deep cascade");

@@ -98,6 +98,7 @@ std::uint32_t VersionSet::PickCompactionLevel(
 VersionSet::CompactionSelection VersionSet::PickLevel0Compaction(
     std::size_t level0_input_count) const {
   CompactionSelection selection;
+  selection.input_level = 0;
   selection.output_level = 1;
   if (level0_input_count == 0) return selection;
 
@@ -153,6 +154,7 @@ VersionSet::CompactionSelection VersionSet::PickLevelCompaction(
     std::uint32_t level) const {
   CompactionSelection selection;
   if (level == 0) return selection;
+  selection.input_level = level;
 
   std::vector<TableMetadata> source;
   for (const auto& [file_number, table] : tables_) {

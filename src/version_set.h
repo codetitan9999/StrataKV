@@ -15,6 +15,7 @@ class VersionSet {
     std::vector<TableMetadata> inputs;
     std::string smallest_key;
     std::string largest_key;
+    std::uint32_t input_level = 0;
     std::uint32_t output_level = 0;
     bool drop_tombstones = false;
   };
