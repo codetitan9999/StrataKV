@@ -28,6 +28,10 @@ struct Options {
   // A value of 0 disables automatic compaction.
   std::size_t level0_compaction_trigger = 4;
 
+  // Stop foreground writes when level 0 reaches this many files until the
+  // background worker reduces the backlog. A value of 0 disables stalls.
+  std::size_t level0_write_stall_trigger = 12;
+
   // Approximate maximum logical bytes emitted into one compaction output.
   // A value of 0 emits a single output table.
   std::size_t max_compaction_output_file_size = 2 * 1024 * 1024;

@@ -91,6 +91,11 @@ int main(int argc, char** argv) {
     }
   }
   const auto write_duration = Clock::now() - write_start;
+  const stratakv::Status wait_status = db->WaitForCompaction();
+  if (!wait_status.ok()) {
+    std::cerr << "background compaction failed: " << wait_status << '\n';
+    return 1;
+  }
   const auto compaction_stats = db->GetCompactionStats();
 
   db.reset();
@@ -190,6 +195,9 @@ int main(int argc, char** argv) {
   std::cout << "shared block cache: " << options.block_cache_size << " bytes\n";
   std::cout << "level-1 compaction target: "
             << options.level1_compaction_trigger_bytes << " bytes\n";
+  std::cout << "level-0 compaction/write-stall triggers: "
+            << options.level0_compaction_trigger << "/"
+            << options.level0_write_stall_trigger << '\n';
   std::cout << "level size multiplier/max level: "
             << options.level_compaction_size_multiplier << "/"
             << options.max_compaction_level << '\n';

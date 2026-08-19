@@ -32,6 +32,9 @@ class DB {
       const ReadOptions& options) const = 0;
   [[nodiscard]] virtual BlockCacheStats GetBlockCacheStats() const = 0;
   [[nodiscard]] virtual CompactionStats GetCompactionStats() const = 0;
+  // Waits until all currently eligible background compaction work finishes.
+  // This is useful for graceful checkpoints, tests, and benchmark reporting.
+  virtual Status WaitForCompaction() = 0;
 };
 
 }  // namespace stratakv

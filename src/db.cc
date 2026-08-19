@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <iomanip>
@@ -13,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -62,6 +64,15 @@ class DBImpl final : public DB {
         file_system_(options.file_system ? options.file_system
                                          : DefaultFileSystem()),
         block_cache_(std::make_shared<BlockCache>(options.block_cache_size)) {}
+
+  ~DBImpl() override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      shutting_down_ = true;
+      compaction_cv_.notify_all();
+    }
+    if (compaction_thread_.joinable()) compaction_thread_.join();
+  }
 
   Status OpenInternal() {
     std::error_code ec;
@@ -142,7 +153,12 @@ class DBImpl final : public DB {
     if (!wal_status.ok()) {
       return wal_status;
     }
-    return file_system_->SyncDirectory(wal_dir_);
+    Status directory_status = file_system_->SyncDirectory(wal_dir_);
+    if (!directory_status.ok()) return directory_status;
+    compaction_scheduled_ = CompactionNeeded();
+    compaction_thread_ = std::thread([this] { BackgroundCompactionLoop(); });
+    if (compaction_scheduled_) compaction_cv_.notify_one();
+    return Status::OK();
   }
 
   Status Put(const WriteOptions& write_options, std::string_view key,
@@ -152,7 +168,8 @@ class DBImpl final : public DB {
       return key_status;
     }
 
-    std::lock_guard<std::mutex> lock(mu_);
+    std::unique_lock<std::mutex> lock(mu_);
+    if (!background_error_.ok()) return background_error_;
     const std::uint64_t sequence = ++last_sequence_;
     LogRecord record{RecordType::kPut, sequence, std::string(key),
                      std::string(value)};
@@ -174,7 +191,9 @@ class DBImpl final : public DB {
       return status;
     }
 
-    return MaybeFlushMemTable();
+    status = MaybeFlushMemTable();
+    if (!status.ok()) return status;
+    return MaybeStallWrites(lock);
   }
 
   Status Delete(const WriteOptions& write_options,
@@ -184,7 +203,8 @@ class DBImpl final : public DB {
       return key_status;
     }
 
-    std::lock_guard<std::mutex> lock(mu_);
+    std::unique_lock<std::mutex> lock(mu_);
+    if (!background_error_.ok()) return background_error_;
     const std::uint64_t sequence = ++last_sequence_;
     LogRecord record{RecordType::kDelete, sequence, std::string(key), ""};
 
@@ -205,7 +225,9 @@ class DBImpl final : public DB {
       return status;
     }
 
-    return MaybeFlushMemTable();
+    status = MaybeFlushMemTable();
+    if (!status.ok()) return status;
+    return MaybeStallWrites(lock);
   }
 
   std::pair<std::string, Status> Get(const ReadOptions& read_options,
@@ -269,6 +291,15 @@ class DBImpl final : public DB {
   CompactionStats GetCompactionStats() const override {
     std::lock_guard<std::mutex> lock(mu_);
     return compaction_stats_;
+  }
+
+  Status WaitForCompaction() override {
+    std::unique_lock<std::mutex> lock(mu_);
+    compaction_cv_.wait(lock, [this] {
+      return (!compaction_scheduled_ && !compaction_running_) ||
+             !background_error_.ok();
+    });
+    return background_error_;
   }
 
  private:
@@ -415,7 +446,54 @@ class DBImpl final : public DB {
     }
 
     memtable_.Clear();
-    return MaybeCompactTables();
+    ScheduleCompaction();
+    return Status::OK();
+  }
+
+  bool CompactionNeeded() const {
+    const bool level0_ready = options_.level0_compaction_trigger > 0 &&
+        version_set_.LevelTableCount(0) >= options_.level0_compaction_trigger;
+    return level0_ready ||
+           version_set_.PickCompactionLevel(
+               options_.level1_compaction_trigger_bytes,
+               options_.level_compaction_size_multiplier,
+               options_.max_compaction_level) != 0;
+  }
+
+  void ScheduleCompaction() {
+    if (!CompactionNeeded() || !background_error_.ok()) return;
+    compaction_scheduled_ = true;
+    compaction_cv_.notify_one();
+  }
+
+  Status MaybeStallWrites(std::unique_lock<std::mutex>& lock) {
+    if (options_.level0_compaction_trigger == 0 ||
+        options_.level0_write_stall_trigger == 0) {
+      return Status::OK();
+    }
+    compaction_cv_.wait(lock, [this] {
+      return version_set_.LevelTableCount(0) <
+                 options_.level0_write_stall_trigger ||
+             !background_error_.ok();
+    });
+    return background_error_;
+  }
+
+  void BackgroundCompactionLoop() {
+    std::unique_lock<std::mutex> lock(mu_);
+    while (true) {
+      compaction_cv_.wait(lock, [this] {
+        return shutting_down_ || compaction_scheduled_;
+      });
+      if (shutting_down_ && !compaction_scheduled_) break;
+      compaction_scheduled_ = false;
+      compaction_running_ = true;
+      Status status = MaybeCompactTables();
+      compaction_running_ = false;
+      if (!status.ok()) background_error_ = std::move(status);
+      compaction_cv_.notify_all();
+      if (shutting_down_) break;
+    }
   }
 
   Status MaybeCompactTables() {
@@ -664,6 +742,12 @@ class DBImpl final : public DB {
   std::filesystem::path retired_wal_path_;
 
   mutable std::mutex mu_;
+  std::condition_variable compaction_cv_;
+  std::thread compaction_thread_;
+  bool compaction_scheduled_ = false;
+  bool compaction_running_ = false;
+  bool shutting_down_ = false;
+  Status background_error_ = Status::OK();
   MemTable memtable_;
   std::vector<TableState> tables_;
   VersionSet version_set_;

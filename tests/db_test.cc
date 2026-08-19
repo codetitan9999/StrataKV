@@ -604,6 +604,7 @@ void CompactsFlushedTables(TestRunner* runner) {
     runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "c", "3"), "put c");
     runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "a", "1"), "put a");
     runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "b", "2"), "put b");
+    runner->ExpectOk(db->WaitForCompaction(), "wait for table compaction");
 
     runner->Expect(CountSSTables(dir.path()) == 1,
                    "compaction should replace three tables with one");
@@ -628,6 +629,31 @@ void CompactsFlushedTables(TestRunner* runner) {
                  "compacted table should reopen with sorted keys");
 }
 
+void ShutdownDrainsBackgroundCompaction(TestRunner* runner) {
+  TempDir dir;
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.level0_compaction_trigger = 3;
+
+  auto db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "a", "one"),
+                   "put a before shutdown");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "b", "two"),
+                   "put b before shutdown");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "c", "three"),
+                   "schedule compaction before shutdown");
+  db.reset();
+
+  runner->Expect(CountSSTables(dir.path()) == 1,
+                 "shutdown should drain scheduled compaction");
+  db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+  auto [value, status] = db->Get(stratakv::ReadOptions{}, "b");
+  runner->ExpectOk(status, "read compacted value after shutdown");
+  runner->Expect(value == "two", "shutdown compaction should remain durable");
+}
+
 void CompactionDropsCoveredTombstones(TestRunner* runner) {
   TempDir dir;
   stratakv::Options options;
@@ -646,6 +672,7 @@ void CompactionDropsCoveredTombstones(TestRunner* runner) {
                      "delete alpha before compaction");
     runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "beta", "two"),
                      "put beta to trigger compaction");
+    runner->ExpectOk(db->WaitForCompaction(), "wait for tombstone compaction");
 
     runner->Expect(CountSSTables(dir.path()) == 1,
                    "compaction should leave one live table");
@@ -688,6 +715,7 @@ void CompactionSplitsOutputsAndRetainsDisjointLevelFiles(TestRunner* runner) {
                    "put first m");
   runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "z", "old-z"),
                    "put disjoint z");
+  runner->ExpectOk(db->WaitForCompaction(), "wait for split compaction");
   runner->Expect(CountSSTables(dir.path()) == 3,
                  "first compaction should split into three level files");
 
@@ -697,6 +725,7 @@ void CompactionSplitsOutputsAndRetainsDisjointLevelFiles(TestRunner* runner) {
                    "put n");
   runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "y", "new-y"),
                    "put y to compact overlapping range");
+  runner->ExpectOk(db->WaitForCompaction(), "wait for overlap compaction");
   runner->Expect(CountSSTables(dir.path()) == 5,
                  "second compaction should retain disjoint z table");
 
@@ -733,6 +762,7 @@ void IteratorSurvivesCompactionCleanup(TestRunner* runner) {
 
   runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "c", "three"),
                    "put c to trigger compaction");
+  runner->ExpectOk(db->WaitForCompaction(), "wait for pinned compaction");
   runner->Expect(CountSSTables(dir.path()) == 3,
                  "pinned iterator should retain its two obsolete tables");
 
@@ -765,6 +795,7 @@ void CascadesLevelOneCompactionIntoLevelTwo(TestRunner* runner) {
                    "put bravo before level cascade");
   runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "charlie", "three"),
                    "trigger level-one cascade");
+  runner->ExpectOk(db->WaitForCompaction(), "wait for level cascade");
   runner->Expect(ManifestLevels(dir.path()) == std::vector<std::uint32_t>({2}),
                  "oversized level one should compact into level two");
   const stratakv::CompactionStats first_stats = db->GetCompactionStats();
@@ -797,6 +828,7 @@ void CascadesLevelOneCompactionIntoLevelTwo(TestRunner* runner) {
                    "add second cascade input");
   runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "echo", "five"),
                    "trigger overlapping level-two compaction");
+  runner->ExpectOk(db->WaitForCompaction(), "wait for overlap cascade");
   auto [value, status] = db->Get(stratakv::ReadOptions{}, "alpha");
   (void)value;
   runner->Expect(status.code() == stratakv::Status::Code::kNotFound,
@@ -827,6 +859,7 @@ void CascadesCompactionThroughGeometricLevels(TestRunner* runner) {
                    "put bravo before deep cascade");
   runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "charlie", "three"),
                    "trigger deep cascade");
+  runner->ExpectOk(db->WaitForCompaction(), "wait for deep cascade");
   runner->Expect(ManifestLevels(dir.path()) == std::vector<std::uint32_t>({4}),
                  "geometric targets should cascade output to the maximum level");
   runner->Expect(db->GetCompactionStats().jobs == 4,
@@ -873,6 +906,7 @@ int main() {
   IteratorReportsDeferredBlockErrors(&runner);
   MissingManifestTableFailsOpen(&runner);
   CompactsFlushedTables(&runner);
+  ShutdownDrainsBackgroundCompaction(&runner);
   CompactionDropsCoveredTombstones(&runner);
   CompactionSplitsOutputsAndRetainsDisjointLevelFiles(&runner);
   IteratorSurvivesCompactionCleanup(&runner);
