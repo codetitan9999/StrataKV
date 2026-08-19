@@ -156,6 +156,15 @@ scheduler pass. If both have eligible work, the scheduler alternates between
 them. This retains prompt level-0 relief without allowing a flush backlog to
 indefinitely postpone already over-budget deeper levels.
 
+Compaction scheduling is serviced by one database-owned background thread.
+Flushes publish their level-0 table, signal the worker, and normally return
+without executing compaction inline. If level 0 reaches
+`Options::level0_write_stall_trigger`, writers wait on the worker condition
+until the backlog falls below the bound; disabling automatic compaction also
+disables this stall. `DB::WaitForCompaction` provides an explicit drain point
+and returns persistent worker failures, while database destruction drains any
+scheduled job and joins the worker before storage state is released.
+
 Tombstones are dropped only when no table below the output level overlaps the
 selected range. Otherwise they remain in the output so an unselected older
 value cannot reappear. Destination-level inputs are merged before source-level
@@ -272,6 +281,7 @@ Current tests cover:
 - Per-level byte accounting, geometric compaction scoring, deep adjacent-level
   cascades, and tombstone retention in the presence of deeper overlapping data
 - Per-transition work accounting across deep compaction cascades
+- Background compaction draining, durable reopen, and pinned-iterator cleanup
 
 Next test layers should add broader crash-point matrices around file creation,
 rename, and manifest updates, plus long-running mixed read/write workloads.
@@ -301,7 +311,8 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 1: Storage Skeleton Hardening
 
-- Add background compaction execution and write-rate smoothing
+- Move SSTable merge computation outside the database mutex using immutable
+  flush state and version-checked installation
 - Add structured logging around open/recovery
 - Extend filesystem fault injection beyond WAL operations to SSTable and
   manifest reads and writes
