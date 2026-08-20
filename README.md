@@ -27,7 +27,8 @@ The API is small on purpose. The interesting part is inside the engine: how data
 - Byte-scored, overlap-selected compaction through configurable sorted levels, with
   size-limited outputs, safe tombstone retention, and obsolete-file cleanup
 - Fair compaction scheduling between level 0 and scored sorted levels
-- Background compaction with bounded level-0 write stalls and shutdown draining
+- Background compaction with lock-free merge/output work, version-checked
+  installation, bounded level-0 write stalls, and shutdown draining
 - Cumulative and per-level compaction metrics for jobs, file counts, physical
   bytes, elapsed time, and benchmark write amplification
 - Dependency-free unit tests
@@ -65,7 +66,10 @@ The write path is intentionally straightforward:
    over-budget level compacts one bounded table with all overlaps in the next
    level. When both paths are ready, scheduling alternates between level 0 and
    sorted-level work so flush pressure cannot starve deeper levels. A dedicated
-   worker executes this queue; foreground writes only stop when level 0 reaches
+   worker executes this queue. It pins immutable inputs and releases the database
+   mutex while merging and installing output files, then validates the selected
+   version and publishes a snapshot that includes any concurrent flushes.
+   Foreground writes only stop when level 0 reaches
    `Options::level0_write_stall_trigger`. Each edit atomically replaces the
    manifest, and shutdown drains scheduled work before releasing database state.
 8. On restart, manifest-listed SSTables are loaded first, then the WAL is replayed up to the last complete record.

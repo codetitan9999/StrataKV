@@ -165,6 +165,13 @@ disables this stall. `DB::WaitForCompaction` provides an explicit drain point
 and returns persistent worker failures, while database destruction drains any
 scheduled job and joins the worker before storage state is released.
 
+The worker pins the selected immutable table readers, then releases the database
+mutex for the merge, output construction, file sync, and rename work. Foreground
+reads and sub-stall writes can continue during that I/O. Before publishing, the
+worker reacquires the mutex and verifies that every selected input still belongs
+to the current version. Its atomic manifest snapshot is built from the current
+table set, so level-0 files flushed while the job was unlocked are retained.
+
 Tombstones are dropped only when no table below the output level overlaps the
 selected range. Otherwise they remain in the output so an unselected older
 value cannot reappear. Destination-level inputs are merged before source-level
@@ -281,7 +288,8 @@ Current tests cover:
 - Per-level byte accounting, geometric compaction scoring, deep adjacent-level
   cascades, and tombstone retention in the presence of deeper overlapping data
 - Per-transition work accounting across deep compaction cascades
-- Background compaction draining, durable reopen, and pinned-iterator cleanup
+- Background compaction draining, concurrent foreground flushes during blocked
+  compaction I/O, durable reopen, and pinned-iterator cleanup
 
 Next test layers should add broader crash-point matrices around file creation,
 rename, and manifest updates, plus long-running mixed read/write workloads.
@@ -311,8 +319,6 @@ Benchmarks should use fixed seeds, report configuration, and preserve enough met
 
 ### Milestone 1: Storage Skeleton Hardening
 
-- Move SSTable merge computation outside the database mutex using immutable
-  flush state and version-checked installation
 - Add structured logging around open/recovery
 - Extend filesystem fault injection beyond WAL operations to SSTable and
   manifest reads and writes
