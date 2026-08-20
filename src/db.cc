@@ -488,7 +488,7 @@ class DBImpl final : public DB {
       if (shutting_down_ && !compaction_scheduled_) break;
       compaction_scheduled_ = false;
       compaction_running_ = true;
-      Status status = MaybeCompactTables();
+      Status status = MaybeCompactTables(lock);
       compaction_running_ = false;
       if (!status.ok()) background_error_ = std::move(status);
       compaction_cv_.notify_all();
@@ -496,7 +496,7 @@ class DBImpl final : public DB {
     }
   }
 
-  Status MaybeCompactTables() {
+  Status MaybeCompactTables(std::unique_lock<std::mutex>& lock) {
     while (true) {
       const bool level0_ready = options_.level0_compaction_trigger > 0 &&
           version_set_.LevelTableCount(0) >= options_.level0_compaction_trigger;
@@ -517,18 +517,21 @@ class DBImpl final : public DB {
         if (sorted_ready) prefer_sorted_compaction_ = true;
       }
       if (selection.inputs.empty()) return Status::OK();
-      Status status = CompactTables(selection);
+      Status status = CompactTables(selection, lock);
       if (!status.ok()) return status;
     }
   }
 
-  Status CompactTables(const VersionSet::CompactionSelection& selection) {
+  Status CompactTables(const VersionSet::CompactionSelection& selection,
+                       std::unique_lock<std::mutex>& lock) {
     const auto compaction_start = std::chrono::steady_clock::now();
     std::uint64_t input_bytes = 0;
     CompactionInput input;
     input.max_output_file_size = options_.max_compaction_output_file_size;
     input.drop_tombstones = selection.drop_tombstones;
     input.tables.reserve(selection.inputs.size());
+    std::vector<std::shared_ptr<SSTableReader>> pinned_inputs;
+    pinned_inputs.reserve(selection.inputs.size());
     for (const TableMetadata& metadata : selection.inputs) {
       input_bytes += metadata.file_size_bytes;
       const auto it = std::find_if(
@@ -538,18 +541,89 @@ class DBImpl final : public DB {
       if (it == tables_.end()) {
         return Status::Corruption("selected compaction table is not open");
       }
-      input.tables.push_back(it->reader.get());
+      pinned_inputs.push_back(it->reader);
+      input.tables.push_back(pinned_inputs.back().get());
     }
 
     CompactionOutput output;
     CompactionJob job(db_path_);
+    lock.unlock();
     Status compaction_status = job.Run(input, &output);
+    lock.lock();
     if (!compaction_status.ok()) {
       return compaction_status;
     }
 
-    std::vector<TableState> next_tables;
+    std::vector<std::uint64_t> output_file_numbers;
+    output_file_numbers.reserve(output.files.size());
+    for (std::size_t i = 0; i < output.files.size(); ++i) {
+      output_file_numbers.push_back(next_file_number_++);
+    }
+
+    std::vector<TableState> output_tables;
+    output_tables.reserve(output.files.size());
     std::uint64_t output_bytes = 0;
+    lock.unlock();
+    const Status build_status = [&]() {
+      for (std::size_t output_index = 0; output_index < output.files.size();
+           ++output_index) {
+        const auto& output_entries = output.files[output_index];
+        const std::uint64_t file_number = output_file_numbers[output_index];
+        const std::filesystem::path final_path =
+            TablePath(table_dir_, file_number);
+        const std::filesystem::path temporary_path =
+            final_path.string() + ".tmp";
+
+        SSTableBuilder builder(temporary_path);
+        for (const TableEntry& entry : output_entries) {
+          Status add_status =
+              entry.type == RecordType::kDelete
+                  ? builder.AddDeletion(entry.key)
+                  : builder.Add(entry.key, entry.value);
+          if (!add_status.ok()) return add_status;
+        }
+
+        TableMetadata metadata;
+        Status status = builder.Finish(&metadata);
+        if (!status.ok()) return status;
+        metadata.file_number = file_number;
+        metadata.level = selection.output_level;
+        metadata.file_path = final_path;
+        output_bytes += metadata.file_size_bytes;
+
+        status = file_system_->SyncFile(temporary_path);
+        if (!status.ok()) return status;
+        status = file_system_->Rename(temporary_path, final_path);
+        if (!status.ok()) return status;
+        status = file_system_->SyncDirectory(table_dir_);
+        if (!status.ok()) return status;
+
+        auto [reader, open_status] =
+            SSTableReader::Open(final_path, block_cache_);
+        if (!open_status.ok()) return open_status;
+        output_tables.push_back(TableState{
+            file_number, selection.output_level, std::move(reader)});
+      }
+      return Status::OK();
+    }();
+    lock.lock();
+    if (!build_status.ok()) return build_status;
+
+    // Foreground flushes may have published new level-0 tables while the merge
+    // and output construction ran. The selected immutable inputs must still be
+    // current; retain every newly published table in the installed version.
+    for (const TableMetadata& metadata : selection.inputs) {
+      const auto current = std::find_if(
+          tables_.begin(), tables_.end(), [&](const TableState& table) {
+            return table.file_number == metadata.file_number;
+          });
+      if (current == tables_.end() || current->level != metadata.level) {
+        return Status::Corruption("compaction inputs changed before install");
+      }
+    }
+
+    std::vector<TableState> next_tables;
+    next_tables.reserve(tables_.size() + output_tables.size());
     for (const TableState& table : tables_) {
       const bool selected = std::any_of(
           selection.inputs.begin(), selection.inputs.end(),
@@ -558,57 +632,8 @@ class DBImpl final : public DB {
           });
       if (!selected) next_tables.push_back(table);
     }
-
-    for (const auto& output_entries : output.files) {
-      const std::uint64_t file_number = next_file_number_++;
-      const std::filesystem::path final_path =
-          TablePath(table_dir_, file_number);
-      const std::filesystem::path temporary_path =
-          final_path.string() + ".tmp";
-
-      SSTableBuilder builder(temporary_path);
-      for (const TableEntry& entry : output_entries) {
-        Status add_status =
-            entry.type == RecordType::kDelete
-                ? builder.AddDeletion(entry.key)
-                : builder.Add(entry.key, entry.value);
-        if (!add_status.ok()) {
-          return add_status;
-        }
-      }
-
-      TableMetadata metadata;
-      Status finish_status = builder.Finish(&metadata);
-      if (!finish_status.ok()) {
-        return finish_status;
-      }
-      metadata.file_number = file_number;
-      metadata.level = selection.output_level;
-      metadata.file_path = final_path;
-      output_bytes += metadata.file_size_bytes;
-
-      Status install_status = file_system_->SyncFile(temporary_path);
-      if (!install_status.ok()) {
-        return install_status;
-      }
-      install_status = file_system_->Rename(temporary_path, final_path);
-      if (!install_status.ok()) {
-        return install_status;
-      }
-      install_status = file_system_->SyncDirectory(table_dir_);
-      if (!install_status.ok()) {
-        return install_status;
-      }
-
-      auto [reader, open_status] =
-          SSTableReader::Open(final_path, block_cache_);
-      if (!open_status.ok()) {
-        return open_status;
-      }
-
-      next_tables.push_back(
-          TableState{file_number, selection.output_level, std::move(reader)});
-    }
+    next_tables.insert(next_tables.end(), output_tables.begin(),
+                       output_tables.end());
 
     std::vector<TableMetadata> manifest_snapshot;
     manifest_snapshot.reserve(next_tables.size());

@@ -4,11 +4,14 @@
 #include "manifest.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -118,6 +121,48 @@ class FailingWalRotationFileSystem final : public stratakv::FileSystem {
 
  private:
   bool fail_next_wal_directory_sync_ = false;
+  std::shared_ptr<stratakv::FileSystem> delegate_ =
+      stratakv::DefaultFileSystem();
+};
+
+class BlockingCompactionRenameFileSystem final : public stratakv::FileSystem {
+ public:
+  stratakv::Status SyncFile(const std::filesystem::path& path) override {
+    return delegate_->SyncFile(path);
+  }
+  stratakv::Status Rename(const std::filesystem::path& from,
+                          const std::filesystem::path& to) override {
+    if (to.filename() == "000004.sst") {
+      std::unique_lock<std::mutex> lock(mu_);
+      compaction_blocked_ = true;
+      cv_.notify_all();
+      cv_.wait(lock, [this] { return released_; });
+    }
+    return delegate_->Rename(from, to);
+  }
+  stratakv::Status SyncDirectory(const std::filesystem::path& path) override {
+    return delegate_->SyncDirectory(path);
+  }
+  stratakv::Status Remove(const std::filesystem::path& path) override {
+    return delegate_->Remove(path);
+  }
+
+  void WaitUntilCompactionBlocks() {
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [this] { return compaction_blocked_; });
+  }
+
+  void ReleaseCompaction() {
+    std::lock_guard<std::mutex> lock(mu_);
+    released_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool compaction_blocked_ = false;
+  bool released_ = false;
   std::shared_ptr<stratakv::FileSystem> delegate_ =
       stratakv::DefaultFileSystem();
 };
@@ -654,6 +699,40 @@ void ShutdownDrainsBackgroundCompaction(TestRunner* runner) {
   runner->Expect(value == "two", "shutdown compaction should remain durable");
 }
 
+void ForegroundWritesContinueDuringCompaction(TestRunner* runner) {
+  TempDir dir;
+  auto file_system = std::make_shared<BlockingCompactionRenameFileSystem>();
+  stratakv::Options options;
+  options.write_buffer_size = 1;
+  options.level0_compaction_trigger = 3;
+  options.level0_write_stall_trigger = 10;
+  options.file_system = file_system;
+
+  auto db = OpenOrFail(runner, dir.path(), options);
+  if (!db) return;
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "a", "one"), "put a");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "b", "two"), "put b");
+  runner->ExpectOk(db->Put(stratakv::WriteOptions{}, "c", "three"), "put c");
+  file_system->WaitUntilCompactionBlocks();
+
+  auto write = std::async(std::launch::async, [&] {
+    return db->Put(stratakv::WriteOptions{}, "d", "four");
+  });
+  const bool completed_while_blocked =
+      write.wait_for(std::chrono::milliseconds(500)) ==
+      std::future_status::ready;
+  file_system->ReleaseCompaction();
+  runner->Expect(completed_while_blocked,
+                 "foreground write should not wait for compaction I/O");
+  runner->ExpectOk(write.get(), "put d during compaction");
+  runner->ExpectOk(db->WaitForCompaction(), "wait for unlocked compaction");
+
+  auto [value, status] = db->Get(stratakv::ReadOptions{}, "d");
+  runner->ExpectOk(status, "get concurrently flushed value");
+  runner->Expect(value == "four",
+                 "compaction install should retain concurrent flushes");
+}
+
 void CompactionDropsCoveredTombstones(TestRunner* runner) {
   TempDir dir;
   stratakv::Options options;
@@ -907,6 +986,7 @@ int main() {
   MissingManifestTableFailsOpen(&runner);
   CompactsFlushedTables(&runner);
   ShutdownDrainsBackgroundCompaction(&runner);
+  ForegroundWritesContinueDuringCompaction(&runner);
   CompactionDropsCoveredTombstones(&runner);
   CompactionSplitsOutputsAndRetainsDisjointLevelFiles(&runner);
   IteratorSurvivesCompactionCleanup(&runner);
