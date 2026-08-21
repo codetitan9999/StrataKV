@@ -135,6 +135,13 @@ key range, and adds every overlapping level-1 table. Disjoint level-1 files are
 left installed. Existing level-1 inputs are merged first, followed by level-0
 inputs from oldest to newest, so the newest record deterministically wins.
 
+Input tables are traversed lazily through a heap merge that keeps one current
+entry per source. Duplicate keys are resolved by input precedence as they are
+encountered, and each size-limited output is handed to the SSTable builder and
+installed before the merge proceeds to later output files. Peak merge memory is
+therefore bounded by the source frontier plus one configured output rather than
+the total input or job output size.
+
 The merged key stream is partitioned into non-overlapping level-1 outputs using
 `Options::max_compaction_output_file_size` as an approximate logical-size
 target. Every output is synced and installed before one atomic manifest
@@ -166,7 +173,8 @@ and returns persistent worker failures, while database destruction drains any
 scheduled job and joins the worker before storage state is released.
 
 The worker pins the selected immutable table readers, then releases the database
-mutex for the merge, output construction, file sync, and rename work. Foreground
+mutex for the streaming merge, incremental output construction, file sync, and
+rename work. Foreground
 reads and sub-stall writes can continue during that I/O. Before publishing, the
 worker reacquires the mutex and verifies that every selected input still belongs
 to the current version. Its atomic manifest snapshot is built from the current
@@ -288,6 +296,8 @@ Current tests cover:
 - Per-level byte accounting, geometric compaction scoring, deep adjacent-level
   cascades, and tombstone retention in the presence of deeper overlapping data
 - Per-transition work accounting across deep compaction cascades
+- Streaming compaction precedence, output splitting, tombstone handling, and
+  incremental output failure propagation
 - Background compaction draining, concurrent foreground flushes during blocked
   compaction I/O, durable reopen, and pinned-iterator cleanup
 
