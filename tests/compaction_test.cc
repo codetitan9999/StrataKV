@@ -96,12 +96,15 @@ void MergesNewestEntriesAndDropsCoveredTombstones(TestRunner* runner) {
   stratakv::CompactionInput input;
   input.tables = {first.get(), second.get()};
 
-  stratakv::CompactionOutput output;
+  std::vector<std::vector<stratakv::TableEntry>> output;
   stratakv::CompactionJob job(dir.path());
-  runner->ExpectOk(job.Run(input, &output), "run compaction job");
+  runner->ExpectOk(job.Run(input, [&](auto entries) {
+                     output.push_back(std::move(entries));
+                     return stratakv::Status::OK();
+                   }), "run compaction job");
 
   std::vector<std::string> keys;
-  for (const auto& file : output.files) {
+  for (const auto& file : output) {
     for (const stratakv::TableEntry& entry : file) keys.push_back(entry.key);
   }
 
@@ -119,10 +122,13 @@ void SplitsOutputsAtConfiguredSize(TestRunner* runner) {
   stratakv::CompactionInput input;
   input.tables = {table.get()};
   input.max_output_file_size = 30;
-  stratakv::CompactionOutput output;
+  std::vector<std::vector<stratakv::TableEntry>> output;
   stratakv::CompactionJob job(dir.path());
-  runner->ExpectOk(job.Run(input, &output), "run split compaction");
-  runner->Expect(output.files.size() == 3,
+  runner->ExpectOk(job.Run(input, [&](auto entries) {
+                     output.push_back(std::move(entries));
+                     return stratakv::Status::OK();
+                   }), "run split compaction");
+  runner->Expect(output.size() == 3,
                  "compaction should emit size-limited files");
 }
 
@@ -134,19 +140,45 @@ void RetainsTombstonesForDeeperLevels(TestRunner* runner) {
   stratakv::CompactionInput input;
   input.tables = {table.get()};
   input.drop_tombstones = false;
-  stratakv::CompactionOutput output;
+  std::vector<std::vector<stratakv::TableEntry>> output;
   stratakv::CompactionJob job(dir.path());
-  runner->ExpectOk(job.Run(input, &output), "run tombstone compaction");
-  runner->Expect(output.files.size() == 1 && output.files[0].size() == 1 &&
-                     output.files[0][0].type == stratakv::RecordType::kDelete,
+  runner->ExpectOk(job.Run(input, [&](auto entries) {
+                     output.push_back(std::move(entries));
+                     return stratakv::Status::OK();
+                   }), "run tombstone compaction");
+  runner->Expect(output.size() == 1 && output[0].size() == 1 &&
+                     output[0][0].type == stratakv::RecordType::kDelete,
                  "compaction should retain tombstone when requested");
 }
 
 void RejectsNullOutput(TestRunner* runner) {
   stratakv::CompactionJob job(std::filesystem::temp_directory_path());
-  const stratakv::Status status = job.Run(stratakv::CompactionInput{}, nullptr);
+  const stratakv::Status status =
+      job.Run(stratakv::CompactionInput{}, {});
   runner->Expect(status.code() == stratakv::Status::Code::kInvalidArgument,
                  "compaction should reject null output");
+}
+
+void StopsStreamingWhenOutputFails(TestRunner* runner) {
+  TempDir dir;
+  auto table = BuildTableOrNull(
+      runner, dir.path() / "000001.sst",
+      {{stratakv::RecordType::kPut, "alpha", "11111"},
+       {stratakv::RecordType::kPut, "bravo", "22222"},
+       {stratakv::RecordType::kPut, "charlie", "33333"}});
+  stratakv::CompactionInput input;
+  input.tables = {table.get()};
+  input.max_output_file_size = 30;
+  int calls = 0;
+  stratakv::CompactionJob job(dir.path());
+  const stratakv::Status status = job.Run(input, [&](auto) {
+    ++calls;
+    return stratakv::Status::IOError("injected output failure");
+  });
+  runner->Expect(status.code() == stratakv::Status::Code::kIOError,
+                 "compaction should propagate output failure");
+  runner->Expect(calls == 1,
+                 "compaction should stop after the first failed output");
 }
 
 }  // namespace
@@ -157,5 +189,6 @@ int main() {
   SplitsOutputsAtConfiguredSize(&runner);
   RetainsTombstonesForDeeperLevels(&runner);
   RejectsNullOutput(&runner);
+  StopsStreamingWhenOutputFails(&runner);
   return runner.Finish();
 }

@@ -545,30 +545,15 @@ class DBImpl final : public DB {
       input.tables.push_back(pinned_inputs.back().get());
     }
 
-    CompactionOutput output;
     CompactionJob job(db_path_);
-    lock.unlock();
-    Status compaction_status = job.Run(input, &output);
-    lock.lock();
-    if (!compaction_status.ok()) {
-      return compaction_status;
-    }
-
-    std::vector<std::uint64_t> output_file_numbers;
-    output_file_numbers.reserve(output.files.size());
-    for (std::size_t i = 0; i < output.files.size(); ++i) {
-      output_file_numbers.push_back(next_file_number_++);
-    }
-
     std::vector<TableState> output_tables;
-    output_tables.reserve(output.files.size());
     std::uint64_t output_bytes = 0;
     lock.unlock();
-    const Status build_status = [&]() {
-      for (std::size_t output_index = 0; output_index < output.files.size();
-           ++output_index) {
-        const auto& output_entries = output.files[output_index];
-        const std::uint64_t file_number = output_file_numbers[output_index];
+    Status compaction_status = job.Run(
+        input, [&](std::vector<TableEntry>&& output_entries) {
+        lock.lock();
+        const std::uint64_t file_number = next_file_number_++;
+        lock.unlock();
         const std::filesystem::path final_path =
             TablePath(table_dir_, file_number);
         const std::filesystem::path temporary_path =
@@ -603,11 +588,10 @@ class DBImpl final : public DB {
         if (!open_status.ok()) return open_status;
         output_tables.push_back(TableState{
             file_number, selection.output_level, std::move(reader)});
-      }
-      return Status::OK();
-    }();
+        return Status::OK();
+      });
     lock.lock();
-    if (!build_status.ok()) return build_status;
+    if (!compaction_status.ok()) return compaction_status;
 
     // Foreground flushes may have published new level-0 tables while the merge
     // and output construction ran. The selected immutable inputs must still be
@@ -675,7 +659,7 @@ class DBImpl final : public DB {
             .count();
     ++compaction_stats_.jobs;
     compaction_stats_.input_files += selection.inputs.size();
-    compaction_stats_.output_files += output.files.size();
+    compaction_stats_.output_files += output_tables.size();
     compaction_stats_.bytes_read += input_bytes;
     compaction_stats_.bytes_written += output_bytes;
     compaction_stats_.elapsed_nanoseconds += elapsed_nanoseconds;
@@ -692,7 +676,7 @@ class DBImpl final : public DB {
     }
     ++level_stats->jobs;
     level_stats->input_files += selection.inputs.size();
-    level_stats->output_files += output.files.size();
+    level_stats->output_files += output_tables.size();
     level_stats->bytes_read += input_bytes;
     level_stats->bytes_written += output_bytes;
     level_stats->elapsed_nanoseconds += elapsed_nanoseconds;

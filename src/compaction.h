@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <vector>
 
 #include "record.h"
@@ -15,15 +16,14 @@ struct CompactionInput {
   bool drop_tombstones = true;
 };
 
-struct CompactionOutput {
-  std::vector<std::vector<TableEntry>> files;
-};
+using CompactionOutputSink =
+    std::function<Status(std::vector<TableEntry>&& entries)>;
 
 class CompactionJob {
  public:
   explicit CompactionJob(std::filesystem::path db_path);
 
-  Status Run(const CompactionInput& input, CompactionOutput* output);
+  Status Run(const CompactionInput& input, const CompactionOutputSink& sink);
 
  private:
   std::filesystem::path db_path_;

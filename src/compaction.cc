@@ -1,6 +1,8 @@
 #include "compaction.h"
 
-#include <map>
+#include <memory>
+#include <queue>
+#include <string>
 #include <utility>
 
 namespace stratakv {
@@ -9,45 +11,81 @@ CompactionJob::CompactionJob(std::filesystem::path db_path)
     : db_path_(std::move(db_path)) {}
 
 Status CompactionJob::Run(const CompactionInput& input,
-                          CompactionOutput* output) {
-  if (output == nullptr) {
-    return Status::InvalidArgument("compaction output must not be null");
+                          const CompactionOutputSink& sink) {
+  if (!sink) {
+    return Status::InvalidArgument("compaction output sink must not be null");
   }
 
-  std::map<std::string, TableEntry> latest_entries;
-  for (const SSTableReader* table : input.tables) {
+  struct Source {
+    std::unique_ptr<InternalIterator> iterator;
+    std::size_t precedence = 0;
+  };
+  struct HeapEntry {
+    std::string key;
+    std::size_t source = 0;
+  };
+  const auto later_key = [](const HeapEntry& left, const HeapEntry& right) {
+    if (left.key != right.key) return left.key > right.key;
+    return left.source < right.source;
+  };
+
+  std::vector<Source> sources;
+  sources.reserve(input.tables.size());
+  std::priority_queue<HeapEntry, std::vector<HeapEntry>, decltype(later_key)>
+      heap(later_key);
+  for (std::size_t index = 0; index < input.tables.size(); ++index) {
+    const SSTableReader* table = input.tables[index];
     if (table == nullptr) {
       return Status::InvalidArgument("compaction input table must not be null");
     }
-
-    auto [entries, read_status] = table->ReadAll();
-    if (!read_status.ok()) {
-      return read_status;
+    auto iterator = table->NewEntryIterator();
+    iterator->SeekToFirst();
+    if (!iterator->status().ok()) return iterator->status();
+    sources.push_back(Source{std::move(iterator), index});
+    if (sources.back().iterator->Valid()) {
+      heap.push(HeapEntry{std::string(sources.back().iterator->key()), index});
     }
-    for (const TableEntry& entry : entries) {
-      if (entry.type == RecordType::kDelete) {
-        latest_entries[entry.key] = entry;
-      } else {
-        latest_entries[entry.key] = entry;
+  }
+
+  std::vector<TableEntry> output;
+  std::size_t output_bytes = 0;
+  while (!heap.empty()) {
+    const std::string key = heap.top().key;
+    TableEntry entry;
+    std::size_t winning_precedence = 0;
+    bool have_entry = false;
+    while (!heap.empty() && heap.top().key == key) {
+      const std::size_t source_index = heap.top().source;
+      heap.pop();
+      Source& source = sources[source_index];
+      if (!have_entry || source.precedence >= winning_precedence) {
+        entry = TableEntry{source.iterator->type(),
+                           std::string(source.iterator->key()),
+                           std::string(source.iterator->value())};
+        winning_precedence = source.precedence;
+        have_entry = true;
+      }
+      source.iterator->Next();
+      if (!source.iterator->status().ok()) return source.iterator->status();
+      if (source.iterator->Valid()) {
+        heap.push(HeapEntry{std::string(source.iterator->key()), source_index});
       }
     }
-  }
 
-  output->files.clear();
-  std::size_t output_bytes = 0;
-  for (const auto& [key, entry] : latest_entries) {
     if (entry.type == RecordType::kDelete && input.drop_tombstones) continue;
     const std::size_t entry_bytes = key.size() + entry.value.size() + 16;
-    if (!output->files.empty() && !output->files.back().empty() &&
-        input.max_output_file_size > 0 &&
+    if (!output.empty() && input.max_output_file_size > 0 &&
         output_bytes + entry_bytes > input.max_output_file_size) {
-      output->files.emplace_back();
+      Status status = sink(std::move(output));
+      if (!status.ok()) return status;
+      output.clear();
       output_bytes = 0;
     }
-    if (output->files.empty()) output->files.emplace_back();
-    output->files.back().push_back(entry);
+    output.push_back(std::move(entry));
     output_bytes += entry_bytes;
   }
+
+  if (!output.empty()) return sink(std::move(output));
 
   return Status::OK();
 }
