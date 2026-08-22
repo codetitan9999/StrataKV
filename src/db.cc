@@ -548,48 +548,55 @@ class DBImpl final : public DB {
     CompactionJob job(db_path_);
     std::vector<TableState> output_tables;
     std::uint64_t output_bytes = 0;
+    std::unique_ptr<SSTableBuilder> output_builder;
+    std::filesystem::path output_final_path;
+    std::filesystem::path output_temporary_path;
+    std::uint64_t output_file_number = 0;
     lock.unlock();
-    Status compaction_status = job.Run(
-        input, [&](std::vector<TableEntry>&& output_entries) {
+    CompactionOutputSink sink;
+    sink.add = [&](const TableEntry& entry) {
+      if (!output_builder) {
         lock.lock();
-        const std::uint64_t file_number = next_file_number_++;
+        output_file_number = next_file_number_++;
         lock.unlock();
-        const std::filesystem::path final_path =
-            TablePath(table_dir_, file_number);
-        const std::filesystem::path temporary_path =
-            final_path.string() + ".tmp";
+        output_final_path = TablePath(table_dir_, output_file_number);
+        output_temporary_path = output_final_path.string() + ".tmp";
+        output_builder =
+            std::make_unique<SSTableBuilder>(output_temporary_path);
+      }
+      return entry.type == RecordType::kDelete
+                 ? output_builder->AddDeletion(entry.key)
+                 : output_builder->Add(entry.key, entry.value);
+    };
+    sink.finish = [&]() {
+      if (!output_builder) {
+        return Status::InvalidArgument(
+            "cannot finish empty compaction output");
+      }
+      TableMetadata metadata;
+      Status status = output_builder->Finish(&metadata);
+      if (!status.ok()) return status;
+      output_builder.reset();
+      metadata.file_number = output_file_number;
+      metadata.level = selection.output_level;
+      metadata.file_path = output_final_path;
+      output_bytes += metadata.file_size_bytes;
 
-        SSTableBuilder builder(temporary_path);
-        for (const TableEntry& entry : output_entries) {
-          Status add_status =
-              entry.type == RecordType::kDelete
-                  ? builder.AddDeletion(entry.key)
-                  : builder.Add(entry.key, entry.value);
-          if (!add_status.ok()) return add_status;
-        }
+      status = file_system_->SyncFile(output_temporary_path);
+      if (!status.ok()) return status;
+      status = file_system_->Rename(output_temporary_path, output_final_path);
+      if (!status.ok()) return status;
+      status = file_system_->SyncDirectory(table_dir_);
+      if (!status.ok()) return status;
 
-        TableMetadata metadata;
-        Status status = builder.Finish(&metadata);
-        if (!status.ok()) return status;
-        metadata.file_number = file_number;
-        metadata.level = selection.output_level;
-        metadata.file_path = final_path;
-        output_bytes += metadata.file_size_bytes;
-
-        status = file_system_->SyncFile(temporary_path);
-        if (!status.ok()) return status;
-        status = file_system_->Rename(temporary_path, final_path);
-        if (!status.ok()) return status;
-        status = file_system_->SyncDirectory(table_dir_);
-        if (!status.ok()) return status;
-
-        auto [reader, open_status] =
-            SSTableReader::Open(final_path, block_cache_);
-        if (!open_status.ok()) return open_status;
-        output_tables.push_back(TableState{
-            file_number, selection.output_level, std::move(reader)});
-        return Status::OK();
-      });
+      auto [reader, open_status] =
+          SSTableReader::Open(output_final_path, block_cache_);
+      if (!open_status.ok()) return open_status;
+      output_tables.push_back(TableState{
+          output_file_number, selection.output_level, std::move(reader)});
+      return Status::OK();
+    };
+    Status compaction_status = job.Run(input, sink);
     lock.lock();
     if (!compaction_status.ok()) return compaction_status;
 

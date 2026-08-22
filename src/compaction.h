@@ -16,8 +16,10 @@ struct CompactionInput {
   bool drop_tombstones = true;
 };
 
-using CompactionOutputSink =
-    std::function<Status(std::vector<TableEntry>&& entries)>;
+struct CompactionOutputSink {
+  std::function<Status(const TableEntry& entry)> add;
+  std::function<Status()> finish;
+};
 
 class CompactionJob {
  public:

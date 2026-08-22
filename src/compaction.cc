@@ -12,7 +12,7 @@ CompactionJob::CompactionJob(std::filesystem::path db_path)
 
 Status CompactionJob::Run(const CompactionInput& input,
                           const CompactionOutputSink& sink) {
-  if (!sink) {
+  if (!sink.add || !sink.finish) {
     return Status::InvalidArgument("compaction output sink must not be null");
   }
 
@@ -47,7 +47,6 @@ Status CompactionJob::Run(const CompactionInput& input,
     }
   }
 
-  std::vector<TableEntry> output;
   std::size_t output_bytes = 0;
   while (!heap.empty()) {
     const std::string key = heap.top().key;
@@ -74,18 +73,18 @@ Status CompactionJob::Run(const CompactionInput& input,
 
     if (entry.type == RecordType::kDelete && input.drop_tombstones) continue;
     const std::size_t entry_bytes = key.size() + entry.value.size() + 16;
-    if (!output.empty() && input.max_output_file_size > 0 &&
+    if (output_bytes > 0 && input.max_output_file_size > 0 &&
         output_bytes + entry_bytes > input.max_output_file_size) {
-      Status status = sink(std::move(output));
+      Status status = sink.finish();
       if (!status.ok()) return status;
-      output.clear();
       output_bytes = 0;
     }
-    output.push_back(std::move(entry));
+    Status status = sink.add(entry);
+    if (!status.ok()) return status;
     output_bytes += entry_bytes;
   }
 
-  if (!output.empty()) return sink(std::move(output));
+  if (output_bytes > 0) return sink.finish();
 
   return Status::OK();
 }

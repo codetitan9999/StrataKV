@@ -75,13 +75,12 @@ std::uint32_t BloomHash(std::string_view key) {
   return Checksum(key);
 }
 
-std::string BuildBloomFilter(const std::vector<TableEntry>& entries) {
+std::string BuildBloomFilter(const std::vector<std::uint32_t>& hashes) {
   std::uint64_t bit_count =
-      std::max<std::uint64_t>(64, entries.size() * kBloomBitsPerKey);
+      std::max<std::uint64_t>(64, hashes.size() * kBloomBitsPerKey);
   bit_count = (bit_count + 7) & ~std::uint64_t{7};
   std::string bits(static_cast<std::size_t>(bit_count / 8), '\0');
-  for (const auto& entry : entries) {
-    std::uint32_t hash = BloomHash(entry.key);
+  for (std::uint32_t hash : hashes) {
     const std::uint32_t delta = (hash >> 17) | (hash << 15);
     for (std::uint32_t probe = 0; probe < kBloomProbes; ++probe) {
       const std::uint64_t bit = hash % bit_count;
@@ -637,9 +636,81 @@ Status SSTableBuilder::AddInternal(RecordType type, std::string_view key,
     return Status::InvalidArgument("delete entries must not store values");
   }
 
-  entries_.push_back(TableEntry{type, std::string(key), std::string(value)});
+  Status status = EnsureOpen();
+  if (!status.ok()) return status;
+
+  TableEntry entry{type, std::string(key), std::string(value)};
+  std::string encoded;
+  bool restart = block_entry_count_ % kRestartInterval == 0;
+  status = EncodeCompressedEntry(encoded, entry,
+                                 block_entry_count_ == 0
+                                     ? std::string_view{}
+                                     : std::string_view(last_key_),
+                                 restart);
+  if (!status.ok()) return status;
+  if (!data_block_.empty() &&
+      data_block_.size() + encoded.size() +
+              (restart_offsets_.size() + (restart ? 1 : 0) + 1) *
+                  sizeof(std::uint32_t) >
+          target_block_size_) {
+    status = FlushBlock();
+    if (!status.ok()) return status;
+    encoded.clear();
+    restart = true;
+    status = EncodeCompressedEntry(encoded, entry, {}, true);
+    if (!status.ok()) return status;
+  }
+  if (restart) {
+    restart_offsets_.push_back(static_cast<std::uint32_t>(data_block_.size()));
+  }
+  data_block_.append(encoded);
+  ++block_entry_count_;
+  if (!has_last_key_) smallest_key_ = entry.key;
   last_key_ = std::string(key);
   has_last_key_ = true;
+  ++entry_count_;
+  bloom_hashes_.push_back(BloomHash(key));
+  if (data_block_.size() >= target_block_size_) return FlushBlock();
+  return Status::OK();
+}
+
+Status SSTableBuilder::EnsureOpen() {
+  if (stream_.is_open()) return Status::OK();
+  stream_.open(path_, std::ios::binary | std::ios::out | std::ios::trunc);
+  if (!stream_) {
+    return Status::IOError("failed to open SSTable for writing: " +
+                           path_.string());
+  }
+  return Status::OK();
+}
+
+Status SSTableBuilder::FlushBlock() {
+  if (block_entry_count_ == 0) return Status::OK();
+  for (std::uint32_t restart : restart_offsets_) {
+    AppendFixed<std::uint32_t>(data_block_, restart);
+  }
+  AppendFixed<std::uint32_t>(
+      data_block_, static_cast<std::uint32_t>(restart_offsets_.size()));
+  BlockIndexEntry index_entry;
+  index_entry.last_key = last_key_;
+  index_entry.offset = file_offset_;
+  index_entry.size = data_block_.size() + kBlockTrailerSize;
+  index_entry.entry_count = block_entry_count_;
+  const std::uint32_t checksum = Checksum(data_block_);
+  stream_.write(data_block_.data(),
+                static_cast<std::streamsize>(data_block_.size()));
+  std::string trailer;
+  AppendFixed<std::uint32_t>(trailer, checksum);
+  stream_.write(trailer.data(), static_cast<std::streamsize>(trailer.size()));
+  if (!stream_) {
+    return Status::IOError("failed to write SSTable data block: " +
+                           path_.string());
+  }
+  file_offset_ += index_entry.size;
+  index_entries_.push_back(std::move(index_entry));
+  data_block_.clear();
+  restart_offsets_.clear();
+  block_entry_count_ = 0;
   return Status::OK();
 }
 
@@ -650,76 +721,14 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
   if (finished_) {
     return Status::InvalidArgument("SSTable builder is already finished");
   }
-  if (entries_.empty()) {
+  if (entry_count_ == 0) {
     return Status::InvalidArgument("cannot finish an empty SSTable");
   }
-
-  std::string file;
-  std::string data_block;
-  std::vector<std::uint32_t> restart_offsets;
-  std::vector<BlockIndexEntry> index_entries;
-  std::uint64_t block_entry_count = 0;
-  std::size_t entries_written = 0;
-
-  const auto finish_block = [&]() {
-    if (block_entry_count == 0) {
-      return;
-    }
-    BlockIndexEntry index_entry;
-    index_entry.last_key = entries_[entries_written - 1].key;
-    index_entry.offset = static_cast<std::uint64_t>(file.size());
-    for (std::uint32_t restart : restart_offsets) {
-      AppendFixed<std::uint32_t>(data_block, restart);
-    }
-    AppendFixed<std::uint32_t>(data_block,
-                               static_cast<std::uint32_t>(restart_offsets.size()));
-    index_entry.size =
-        static_cast<std::uint64_t>(data_block.size() + kBlockTrailerSize);
-    index_entry.entry_count = block_entry_count;
-    file.append(data_block);
-    AppendFixed<std::uint32_t>(file, Checksum(data_block));
-    index_entries.push_back(std::move(index_entry));
-    data_block.clear();
-    restart_offsets.clear();
-    block_entry_count = 0;
-  };
-
-  for (const auto& entry : entries_) {
-    std::string encoded;
-    const bool restart = block_entry_count % kRestartInterval == 0;
-    Status encode_status = EncodeCompressedEntry(
-        encoded, entry,
-        block_entry_count == 0 ? std::string_view{}
-                               : std::string_view(entries_[entries_written - 1].key),
-        restart);
-    if (!encode_status.ok()) {
-      return encode_status;
-    }
-    if (!data_block.empty() &&
-        data_block.size() + encoded.size() +
-                (restart_offsets.size() + (restart ? 1 : 0) + 1) *
-                    sizeof(std::uint32_t) >
-            target_block_size_) {
-      finish_block();
-      encoded.clear();
-      encode_status = EncodeCompressedEntry(encoded, entry, {}, true);
-      if (!encode_status.ok()) return encode_status;
-    }
-    if (block_entry_count % kRestartInterval == 0) {
-      restart_offsets.push_back(static_cast<std::uint32_t>(data_block.size()));
-    }
-    data_block.append(encoded);
-    ++block_entry_count;
-    ++entries_written;
-    if (data_block.size() >= target_block_size_) {
-      finish_block();
-    }
-  }
-  finish_block();
-
-  const std::uint64_t index_offset = static_cast<std::uint64_t>(file.size());
+  Status status = FlushBlock();
+  if (!status.ok()) return status;
+  const std::uint64_t index_offset = file_offset_;
   std::string index_block;
-  for (const BlockIndexEntry& entry : index_entries) {
+  for (const BlockIndexEntry& entry : index_entries_) {
     AppendFixed<std::uint32_t>(
         index_block, static_cast<std::uint32_t>(entry.last_key.size()));
     index_block.append(entry.last_key);
@@ -727,14 +736,15 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
     AppendFixed<std::uint64_t>(index_block, entry.size);
     AppendFixed<std::uint64_t>(index_block, entry.entry_count);
   }
-  file.append(index_block);
-  const std::uint64_t filter_offset = static_cast<std::uint64_t>(file.size());
-  const std::string filter = BuildBloomFilter(entries_);
-  file.append(filter);
+  stream_.write(index_block.data(),
+                static_cast<std::streamsize>(index_block.size()));
+  const std::uint64_t filter_offset = index_offset + index_block.size();
+  const std::string filter = BuildBloomFilter(bloom_hashes_);
+  stream_.write(filter.data(), static_cast<std::streamsize>(filter.size()));
   std::string footer;
   footer.reserve(kFilterFooterSize);
   AppendFixed<std::uint64_t>(footer,
-                             static_cast<std::uint64_t>(entries_.size()));
+                             entry_count_);
   AppendFixed<std::uint64_t>(footer, index_offset);
   AppendFixed<std::uint64_t>(footer,
                              static_cast<std::uint64_t>(index_block.size()));
@@ -744,27 +754,19 @@ Status SSTableBuilder::Finish(TableMetadata* metadata) {
   AppendFixed<std::uint32_t>(footer, Checksum(filter));
   footer.append(kMagic);
 
-  std::ofstream stream(path_, std::ios::binary | std::ios::out |
-                                  std::ios::trunc);
-  if (!stream) {
-    return Status::IOError("failed to open SSTable for writing: " +
-                           path_.string());
-  }
+  stream_.write(footer.data(), static_cast<std::streamsize>(footer.size()));
+  stream_.flush();
 
-  stream.write(file.data(), static_cast<std::streamsize>(file.size()));
-  stream.write(footer.data(), static_cast<std::streamsize>(footer.size()));
-  stream.flush();
-
-  if (!stream) {
+  if (!stream_) {
     return Status::IOError("failed to write SSTable: " + path_.string());
   }
 
   metadata->file_path = path_;
-  metadata->smallest_key = entries_.front().key;
-  metadata->largest_key = entries_.back().key;
-  metadata->entry_count = static_cast<std::uint64_t>(entries_.size());
+  metadata->smallest_key = smallest_key_;
+  metadata->largest_key = last_key_;
+  metadata->entry_count = entry_count_;
   metadata->file_size_bytes =
-      static_cast<std::uint64_t>(file.size() + footer.size());
+      filter_offset + filter.size() + footer.size();
 
   finished_ = true;
   return Status::OK();

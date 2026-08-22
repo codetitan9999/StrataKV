@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -53,11 +54,21 @@ class SSTableBuilder {
  private:
   Status AddInternal(RecordType type, std::string_view key,
                      std::string_view value);
+  Status FlushBlock();
+  Status EnsureOpen();
 
   std::filesystem::path path_;
   std::size_t target_block_size_;
-  std::vector<TableEntry> entries_;
+  std::ofstream stream_;
+  std::string data_block_;
+  std::vector<std::uint32_t> restart_offsets_;
+  std::vector<TableBlockIndexEntry> index_entries_;
+  std::vector<std::uint32_t> bloom_hashes_;
+  std::string smallest_key_;
   std::string last_key_;
+  std::uint64_t entry_count_ = 0;
+  std::uint64_t block_entry_count_ = 0;
+  std::uint64_t file_offset_ = 0;
   bool has_last_key_ = false;
   bool finished_ = false;
 };

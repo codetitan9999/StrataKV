@@ -97,11 +97,20 @@ void MergesNewestEntriesAndDropsCoveredTombstones(TestRunner* runner) {
   input.tables = {first.get(), second.get()};
 
   std::vector<std::vector<stratakv::TableEntry>> output;
+  std::vector<stratakv::TableEntry> current;
   stratakv::CompactionJob job(dir.path());
-  runner->ExpectOk(job.Run(input, [&](auto entries) {
-                     output.push_back(std::move(entries));
-                     return stratakv::Status::OK();
-                   }), "run compaction job");
+  runner->ExpectOk(
+      job.Run(input,
+              {[&](const auto& entry) {
+                 current.push_back(entry);
+                 return stratakv::Status::OK();
+               },
+               [&] {
+                 output.push_back(std::move(current));
+                 current.clear();
+                 return stratakv::Status::OK();
+               }}),
+      "run compaction job");
 
   std::vector<std::string> keys;
   for (const auto& file : output) {
@@ -123,11 +132,20 @@ void SplitsOutputsAtConfiguredSize(TestRunner* runner) {
   input.tables = {table.get()};
   input.max_output_file_size = 30;
   std::vector<std::vector<stratakv::TableEntry>> output;
+  std::vector<stratakv::TableEntry> current;
   stratakv::CompactionJob job(dir.path());
-  runner->ExpectOk(job.Run(input, [&](auto entries) {
-                     output.push_back(std::move(entries));
-                     return stratakv::Status::OK();
-                   }), "run split compaction");
+  runner->ExpectOk(
+      job.Run(input,
+              {[&](const auto& entry) {
+                 current.push_back(entry);
+                 return stratakv::Status::OK();
+               },
+               [&] {
+                 output.push_back(std::move(current));
+                 current.clear();
+                 return stratakv::Status::OK();
+               }}),
+      "run split compaction");
   runner->Expect(output.size() == 3,
                  "compaction should emit size-limited files");
 }
@@ -141,11 +159,20 @@ void RetainsTombstonesForDeeperLevels(TestRunner* runner) {
   input.tables = {table.get()};
   input.drop_tombstones = false;
   std::vector<std::vector<stratakv::TableEntry>> output;
+  std::vector<stratakv::TableEntry> current;
   stratakv::CompactionJob job(dir.path());
-  runner->ExpectOk(job.Run(input, [&](auto entries) {
-                     output.push_back(std::move(entries));
-                     return stratakv::Status::OK();
-                   }), "run tombstone compaction");
+  runner->ExpectOk(
+      job.Run(input,
+              {[&](const auto& entry) {
+                 current.push_back(entry);
+                 return stratakv::Status::OK();
+               },
+               [&] {
+                 output.push_back(std::move(current));
+                 current.clear();
+                 return stratakv::Status::OK();
+               }}),
+      "run tombstone compaction");
   runner->Expect(output.size() == 1 && output[0].size() == 1 &&
                      output[0][0].type == stratakv::RecordType::kDelete,
                  "compaction should retain tombstone when requested");
@@ -171,14 +198,46 @@ void StopsStreamingWhenOutputFails(TestRunner* runner) {
   input.max_output_file_size = 30;
   int calls = 0;
   stratakv::CompactionJob job(dir.path());
-  const stratakv::Status status = job.Run(input, [&](auto) {
-    ++calls;
-    return stratakv::Status::IOError("injected output failure");
-  });
+  const stratakv::Status status = job.Run(
+      input, {[](const auto&) { return stratakv::Status::OK(); },
+              [&] {
+                ++calls;
+                return stratakv::Status::IOError("injected output failure");
+              }});
   runner->Expect(status.code() == stratakv::Status::Code::kIOError,
                  "compaction should propagate output failure");
   runner->Expect(calls == 1,
                  "compaction should stop after the first failed output");
+}
+
+void StopsStreamingWhenEntrySinkFails(TestRunner* runner) {
+  TempDir dir;
+  auto table = BuildTableOrNull(
+      runner, dir.path() / "000001.sst",
+      {{stratakv::RecordType::kPut, "alpha", "one"},
+       {stratakv::RecordType::kPut, "bravo", "two"},
+       {stratakv::RecordType::kPut, "charlie", "three"}});
+  stratakv::CompactionInput input;
+  input.tables = {table.get()};
+  int entries = 0;
+  int finishes = 0;
+  stratakv::CompactionJob job(dir.path());
+  const stratakv::Status status = job.Run(
+      input,
+      {[&](const auto&) {
+         ++entries;
+         return entries == 2
+                    ? stratakv::Status::IOError("injected entry failure")
+                    : stratakv::Status::OK();
+       },
+       [&] {
+         ++finishes;
+         return stratakv::Status::OK();
+       }});
+  runner->Expect(status.code() == stratakv::Status::Code::kIOError,
+                 "compaction should propagate entry sink failure");
+  runner->Expect(entries == 2 && finishes == 0,
+                 "compaction should stop without finishing a failed output");
 }
 
 }  // namespace
@@ -190,5 +249,6 @@ int main() {
   RetainsTombstonesForDeeperLevels(&runner);
   RejectsNullOutput(&runner);
   StopsStreamingWhenOutputFails(&runner);
+  StopsStreamingWhenEntrySinkFails(&runner);
   return runner.Finish();
 }
