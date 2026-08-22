@@ -13,8 +13,8 @@ The API is small on purpose. The interesting part is inside the engine: how data
   bounded recovery allocation
 - Delete tombstones
 - WAL replay on reopen, including torn-tail recovery
-- Prefix-compressed multi-block SSTables with restart points, per-block
-  checksums, and an on-disk index
+- Incrementally built, prefix-compressed multi-block SSTables with restart
+  points, per-block checksums, an online Bloom filter, and an on-disk index
 - Bloom-filtered, restart-indexed SSTable point reads with a database-wide
   encoded-block LRU cache and metrics
 - Heap-merged streaming range and prefix scans across the memtable and SSTables
@@ -68,7 +68,8 @@ The write path is intentionally straightforward:
    level. When both paths are ready, scheduling alternates between level 0 and
    sorted-level work so flush pressure cannot starve deeper levels. A dedicated
    worker executes this queue. It pins immutable inputs, heap-merges their lazy
-   iterators, and installs each size-limited output before producing the next.
+   iterators directly into an incremental SSTable builder, and installs each
+   size-limited output before producing the next.
    It releases the database mutex during that work, then validates the selected
    version and publishes a snapshot that includes any concurrent flushes.
    Foreground writes only stop when level 0 reaches

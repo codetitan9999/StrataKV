@@ -101,6 +101,12 @@ in a trailing restart array. Restart offsets and intervals are validated during
 decode, bounding reconstruction chains and making malformed offsets explicit
 corruption.
 
+The SSTable builder encodes entries as they arrive, writes completed data blocks
+to the output stream, and retains only the current block, compact block-index
+metadata, and one Bloom hash per key. At finish it writes the index, constructs
+the Bloom bitset from those hashes, and appends the footer. It never retains a
+second vector of complete keys and values for the output table.
+
 The reader loads and verifies only the footer, index, checksummed Bloom filter,
 and first data block at open. A negative Bloom result returns an absent lookup
 without reading a data block. Possible Bloom false positives continue through
@@ -137,10 +143,11 @@ inputs from oldest to newest, so the newest record deterministically wins.
 
 Input tables are traversed lazily through a heap merge that keeps one current
 entry per source. Duplicate keys are resolved by input precedence as they are
-encountered, and each size-limited output is handed to the SSTable builder and
-installed before the merge proceeds to later output files. Peak merge memory is
-therefore bounded by the source frontier plus one configured output rather than
-the total input or job output size.
+encountered, and entries are passed directly to the incremental SSTable builder.
+Each size-limited output is finished and installed before the merge proceeds to
+later output files. Peak compaction memory is therefore bounded by the source
+frontier, one encoded data block, and compact per-output index and Bloom state
+rather than the total input or output size.
 
 The merged key stream is partitioned into non-overlapping level-1 outputs using
 `Options::max_compaction_output_file_size` as an approximate logical-size
